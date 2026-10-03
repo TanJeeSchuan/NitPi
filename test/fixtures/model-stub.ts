@@ -46,8 +46,16 @@ export class ModelStub {
   private script: StubScript;
   readonly requests: RecordedRequest[] = [];
 
-  constructor(script: StubScript, private modelId: string) {
+  /** Test hook: fired before serving each scripted step (0-based). */
+  private readonly onServe?: (requestIndex: number) => void;
+
+  constructor(
+    script: StubScript,
+    private modelId: string,
+    onServe?: (requestIndex: number) => void,
+  ) {
     this.script = [...script];
+    this.onServe = onServe;
   }
 
   /** Append a step (e.g. a rerun turn scripted once earlier runs' outcomes
@@ -87,6 +95,7 @@ export class ModelStub {
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const body = await this.readBody(request);
     this.requests.push({ body: JSON.parse(body) });
+    this.onServe?.(this.scriptIndex);
     const step = this.script[this.scriptIndex];
     this.scriptIndex += 1;
     if (!step) {

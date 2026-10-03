@@ -27,6 +27,11 @@ import { Publisher, PublishError } from "../github/publisher.js";
 import type { GitHubApi } from "../github/publisher.js";
 import { parseFinalReview } from "./artifact.js";
 import {
+  parseUnifiedDiffAnchors,
+  validateFindingAnchors,
+  type InvalidAnchor,
+} from "./anchor-validation.js";
+import {
   buildMatchPrompt,
   matchableComments,
   parseMatchList,
@@ -34,7 +39,7 @@ import {
 } from "./matching.js";
 import type { ReviewHostConfig } from "./config.js";
 import type { ResolvedInstructions } from "./instructions.js";
-import type { RunDocument, RunHistory, StageUsage } from "./run-history.js";
+import type { RunDocument, RunHistory, RunPhase, StageUsage } from "./run-history.js";
 
 export interface ReviewRunRequest {
   readonly repository: string;
@@ -102,6 +107,15 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
           context,
         );
 
+        // Pin the reviewed base→head diff once, at run start: anchor
+        // validation (ticket 02) checks against THIS text even if the pull
+        // request's head moves while the review runs.
+        const pinnedDiff = await readPinnedDiff(host, runDoc.subject);
+        await commitRunUpdate(host, task.input.runId, context, (run) => ({
+          ...run,
+          pinnedDiff,
+        }));
+
         // Primary turn: one prompt, run to completion, Pi keeps the tool loop.
         const prompt = buildPrimaryPrompt(runDoc);
         await runConversationTurn(canonical, prompt, context);
@@ -168,17 +182,60 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
         const prompt = buildReReviewPrompt(runDoc);
         await runConversationTurn(conversation, prompt, context);
 
-        const answer2 = await latestAssistant(conversation, context);
-        const finalMarkdown = answer2?.text ?? "";
-        const parsed = parseFinalReview(finalMarkdown);
+        // Anchor validation against the pinned diff (ticket 02): the final
+        // review freezes only once every remaining anchor is valid. An
+        // invalid anchor goes back to the re-reviewer in this same
+        // conversation, with the reason, to correct or withdraw the finding;
+        // a finding that disappears from a resubmission must be accounted
+        // for in the audit notes (a withdrawal is recorded there).
+        if (!runDoc.pinnedDiff?.trim()) throw new Error("the pinned diff is not recorded on the run");
+        const anchors = parseUnifiedDiffAnchors(runDoc.pinnedDiff);
+        let answer = await latestAssistant(conversation, context);
+        let parsed = parseFinalReview(answer?.text ?? "");
+        let previousLabels = parsed.findings.map((f) => f.label);
+        let invalid = validateFindingAnchors(parsed.findings, anchors);
+        let anchorRounds = 0;
+        while (invalid.length > 0) {
+          if (anchorRounds >= MAX_ANCHOR_ROUNDS) {
+            // The re-reviewer finished with an invalid anchor still in
+            // place: the run fails, nothing is published, and the check is
+            // never a zero-finding success.
+            throw new Error(
+              `re-reviewer finished with invalid inline anchors after ${MAX_ANCHOR_ROUNDS} correction rounds: ${invalid
+                .map((i) => `${i.label} "${i.written}" — ${i.reason}`)
+                .join("; ")}`,
+            );
+          }
+          anchorRounds += 1;
+          await commitRunUpdate(host, task.input.runId, context, (run) => ({
+            ...run,
+            anchorRounds,
+          }));
+          await runConversationTurn(conversation, buildAnchorFeedbackPrompt(invalid), context);
+          answer = await latestAssistant(conversation, context);
+          parsed = parseFinalReview(answer?.text ?? "");
+          const currentLabels = parsed.findings.map((f) => f.label);
+          const unrecorded = previousLabels.filter(
+            (label) => !currentLabels.includes(label) && !parsed.auditNotes.includes(label),
+          );
+          if (unrecorded.length > 0) {
+            throw new Error(
+              `finding(s) ${unrecorded.join(", ")} disappeared from the resubmitted final review without a withdrawal recorded in the audit notes`,
+            );
+          }
+          previousLabels = currentLabels;
+          invalid = validateFindingAnchors(parsed.findings, anchors);
+        }
+
         await commitRunUpdate(host, task.input.runId, context, (run) => ({
           ...run,
-          finalReview: finalMarkdown,
+          finalReview: answer?.text ?? "",
           auditNotes: parsed.auditNotes,
           findings: parsed.findings,
           phase: "final frozen",
+          anchorRounds,
           instructionHashes: { ...run.instructionHashes, reReview: sha256(instructions.text) },
-          usage: { ...run.usage, reReview: answer2?.usageSummary },
+          usage: { ...run.usage, reReview: answer?.usageSummary },
         }));
 
         await runtime.commit(
@@ -295,18 +352,7 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
         );
       } catch (error) {
         const reason = error instanceof PublishError ? error.message : errorText(error);
-        try {
-          await publisher.checkFailure(subject, reason);
-        } catch {
-          // checkFailure failing must not mask the publication reason.
-        }
-        await commitRunUpdateSafe(host, task.input.runId, context, (run) => ({
-          ...run,
-          phase: "publishing",
-          checkStatus: "failure",
-          checkDetail: reason,
-          error: reason,
-        }));
+        await recordRunFailure(host, task.input.runId, context, reason, "publishing");
         await runtime.commit(
           (_tx) =>
             ({
@@ -342,8 +388,19 @@ async function failRun(
   context: Context,
   error: unknown,
 ): Promise<never> {
-  const host = reviewTaskDeps();
   const reason = errorText(error);
+  await recordRunFailure(reviewTaskDeps(), runId, context, reason);
+  throw error instanceof Error ? error : new Error(reason);
+}
+
+/** Shared failure bookkeeping: GitHub check failure + run document update. */
+async function recordRunFailure(
+  host: ReviewTaskDeps,
+  runId: string,
+  context: Context,
+  reason: string,
+  phase?: RunPhase,
+): Promise<void> {
   const runDoc = await host.runHistory.findRun(runId, context);
   try {
     if (runDoc) {
@@ -354,11 +411,11 @@ async function failRun(
   }
   await commitRunUpdateSafe(host, runId, context, (run) => ({
     ...run,
+    ...(phase ? { phase } : {}),
     checkStatus: "failure",
     checkDetail: reason,
     error: reason,
   }));
-  throw error instanceof Error ? error : new Error(reason);
 }
 
 async function commitRunUpdateSafe(
@@ -410,10 +467,12 @@ export interface TurnAnswer {
   usageSummary: { input: number; output: number; totalTokens: number };
 }
 
-/** The newest assistant entry with text. Entry pages are newest-first, so
- * return the first hit found; tool-only assistant messages (no text) are
- * skipped, so the loop keeps walking past them to the newest turn that
- * actually answered. */
+/** The newest assistant entry with text; return the first hit found of the
+ * newest-first page. Tool-only assistant messages (no text) are skipped, so
+ * the loop keeps walking past them to the newest turn that actually answered.
+ * The correction and matching turns depend on this: the resubmitted final
+ * review (ticket 02) and the match list (ticket 04) are the newest assistant
+ * text, not an earlier turn's. */
 async function latestAssistant(conversation: Conversation, context: Context): Promise<TurnAnswer | undefined> {
   const page = await conversation.entries({ conversationId: conversation.id } as never, 20, undefined, context);
   for (const entry of page.items) {
@@ -479,8 +538,42 @@ function buildReReviewPrompt(run: RunDocument): string {
     run.artifact ?? "",
     `--- END FROZEN PRIMARY REVIEW ARTIFACT ---`,
     ``,
-    `Write your final review (one finding per section with an inline location "path | SIDE | line") followed by "# Audit notes".`,
+    `Write your final review (one finding per section with an inline location "path | SIDE | line", or "path | SIDE | line | START_SIDE | startLine" for a range) followed by "# Audit notes".`,
   ].join("\n");
 }
 
-export const __testing = { buildPrimaryPrompt, buildReReviewPrompt };
+/**
+ * Feedback for invalid anchors, returned to the re-reviewer in its own
+ * conversation: correct the anchor to a line of the reviewed diff, or
+ * withdraw the finding (section removed, withdrawal recorded in the audit
+ * notes). Anchors are never guessed; evidence may cite unchanged code.
+ */
+function buildAnchorFeedbackPrompt(invalid: readonly InvalidAnchor[]): string {
+  return [
+    `Your final review has invalid inline anchors. Every finding's inline location must point at a line of the reviewed diff, in the form "path | SIDE | line" or, for a range, "path | SIDE | line | START_SIDE | startLine" (a range must lie on one side). Evidence may cite unchanged code (callers, config); only the inline location must be in the diff.`,
+    ``,
+    `Invalid anchors:`,
+    ...invalid.map((i) => `- ${i.label}: "${i.written}" — ${i.reason}`),
+    ``,
+    `Correct each listed anchor to a line that is in the reviewed diff, or withdraw the finding: remove its section entirely and record the withdrawal in the audit notes. Resubmit the complete final review (every remaining finding, one per section, followed by the audit notes). Anchors are never guessed; a finding you cannot anchor validly is withdrawn.`,
+  ].join("\n");
+}
+
+export const __testing = { buildPrimaryPrompt, buildReReviewPrompt, buildAnchorFeedbackPrompt };
+
+/** Read the pull request's base→head diff (the pinned diff), as GitHub serves it. */
+async function readPinnedDiff(
+  host: ReviewTaskDeps,
+  subject: RunDocument["subject"],
+): Promise<string> {
+  const response = await host.api.getPullRequestDiff(subject.repository, subject.pullNumber);
+  if (response.status !== 200 || typeof response.body !== "string" || !response.body.trim()) {
+    throw new Error(
+      `cannot read the pinned diff for ${subject.repository}#${subject.pullNumber} (HTTP ${response.status})`,
+    );
+  }
+  return response.body;
+}
+
+/** Correction rounds allowed before an unresolved anchor fails the run. */
+const MAX_ANCHOR_ROUNDS = 3;

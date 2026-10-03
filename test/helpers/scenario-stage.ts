@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { openReviewHost, type ReviewHost } from "../../src/review-host/review-host.js";
 import { FakeGitHub } from "../fixtures/fake-github.js";
 import { ModelStub, type StubScript } from "../fixtures/model-stub.js";
-import type { GitRepoFixture } from "../fixtures/git-fixture.js";
+import { unifiedDiff, type GitRepoFixture } from "../fixtures/git-fixture.js";
 
 export interface ScenarioStage {
   fake: FakeGitHub;
@@ -27,6 +27,9 @@ export async function openScenarioStage(
   const fake = new FakeGitHub(
     [{ number: 7, headSha: repo.headSha, baseSha: repo.baseSha, state: "open" }],
     STAGE_ANCHORS,
+    // The host pins this diff at run start (ticket 02) and validates anchors
+    // against it; the fake serves it with the diff media type.
+    { diffText: unifiedDiff() },
   );
   const githubBase = await fake.listen();
   const primaryStub = new ModelStub(opts.primary, "stub-primary");

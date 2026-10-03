@@ -12,6 +12,7 @@
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { once } from "node:events";
+import { parseUnifiedDiffAnchors } from "../../src/review-host/anchor-validation.js";
 
 export interface FakePullRequest {
   number: number;
@@ -42,6 +43,9 @@ export interface FakeReviewComment {
   path: string;
   side: "LEFT" | "RIGHT";
   line: number;
+  /** Range start, present only for range anchors (ticket 02). */
+  startSide?: "LEFT" | "RIGHT";
+  startLine?: number;
   body: string;
   commitId: string;
   author: string;
@@ -72,6 +76,15 @@ export interface FakeGitHubState {
   validationErrors: Map<string, string>;
 }
 
+export interface FakeReviewCommentInput {
+  path?: string;
+  side?: string;
+  line?: number;
+  start_side?: string;
+  start_line?: number;
+  body?: string;
+}
+
 export class FakeGitHub {
   readonly state: FakeGitHubState;
   /** Login → permission level; default writer. Tests override per login. */
@@ -81,8 +94,9 @@ export class FakeGitHub {
   private commentsSeq = 1000;
 
   constructor(
-    pulls: FakePullRequest[],
-    diffAnchors: string[] = [],
+    readonly pulls: FakePullRequest[],
+    readonly diffAnchors: string[] = [],
+    readonly options: { diffText?: string } = {},
     /** What `GET /user` reports as the reviewer bot's login. */
     readonly botLogin: string = "nitpi-reviewer[bot]",
   ) {
@@ -96,6 +110,22 @@ export class FakeGitHub {
       dropNextWrite: { match: /reviews$/, remaining: 0 },
       validationErrors: new Map(),
     };
+    // When the fake serves a PR diff, its validation set derives from that
+    // diff (GitHub is the authority; the host validates against the same
+    // pinned diff it fetches from here).
+    if (options.diffText) {
+      for (const anchor of parseUnifiedDiffAnchors(options.diffText).entries()) {
+        this.state.diffAnchors.add(`${anchor.path}#${anchor.side}#${anchor.line}`);
+      }
+    }
+  }
+
+  /** Serve a different PR diff from now on; its anchors union in. */
+  setPullDiff(diffText: string): void {
+    (this.options as { diffText?: string }).diffText = diffText;
+    for (const anchor of parseUnifiedDiffAnchors(diffText).entries()) {
+      this.state.diffAnchors.add(`${anchor.path}#${anchor.side}#${anchor.line}`);
+    }
   }
 
   async listen(): Promise<string> {
@@ -139,8 +169,9 @@ export class FakeGitHub {
       return;
     }
     const body = ["POST", "PATCH", "PUT"].includes(request.method ?? "") ? await this.readBody(request) : "";
+    const accept = String(request.headers.accept ?? "");
     try {
-      this.route(request.method ?? "GET", path, body, response);
+      this.route(request.method ?? "GET", path, body, response, accept);
     } catch (error) {
       this.respond(response, 500, { message: String(error) });
     }
@@ -150,12 +181,12 @@ export class FakeGitHub {
     // Mirrors route() writes for the drop scenario without a response.
     const prMatch = path.match(/^\/repos\/[^/]+\/[^/]+\/pulls\/(\d+)\/reviews$/);
     if (prMatch) {
-      const parsed = JSON.parse(body) as { body?: string; commit_id?: string; comments?: Array<{ path: string; side?: string; line?: number; body?: string }> };
+      const parsed = JSON.parse(body) as { body?: string; commit_id?: string; comments?: FakeReviewCommentInput[] };
       this.createReview(Number(prMatch[1]), parsed);
     }
   }
 
-  private route(method: string, path: string, body: string, response: ServerResponse): void {
+  private route(method: string, path: string, body: string, response: ServerResponse, accept = ""): void {
     if (method === "POST" && (path === "/api/graphql" || path === "/graphql")) {
       this.handleGraphql(body, response);
       return;
@@ -165,20 +196,19 @@ export class FakeGitHub {
       this.respond(response, 200, { login: this.botLogin });
       return;
     }
-
     const prMatch = path.match(/^\/repos\/[^/]+\/[^/]+\/pulls\/(\d+)\/reviews$/);
     if (method === "POST" && prMatch) {
       const parsed = JSON.parse(body) as {
         body?: string;
         commit_id?: string;
         event?: string;
-        comments?: Array<{ path: string; side?: string; line?: number; body?: string }>;
+        comments?: FakeReviewCommentInput[];
       };
       if (prMatch && !this.state.pulls[Number(prMatch[1])]) {
         this.respond(response, 404, { message: "Not Found" });
         return;
       }
-      const bad = parsed.comments?.find((c) => !this.anchorIsValid(c.path, c.side, c.line));
+      const bad = parsed.comments?.find((c) => !this.anchorIsValid(c));
       if (bad) {
         this.respond(response, 422, { message: "Validation Failed", detail: `invalid anchor: ${bad.path}:${bad.line}` });
         return;
@@ -220,7 +250,7 @@ export class FakeGitHub {
         return;
       }
       const parsed = JSON.parse(body) as { commit_id?: string; path?: string; side?: string; line?: number; body?: string };
-      if (!this.anchorIsValid(parsed.path, parsed.side, parsed.line)) {
+      if (!this.anchorIsValid(parsed)) {
         this.respond(response, 422, {
           message: "Validation Failed",
           detail: `invalid anchor: ${parsed.path}:${parsed.line}`,
@@ -288,6 +318,17 @@ export class FakeGitHub {
         this.respond(response, 404, { message: "Not Found" });
         return;
       }
+      // The diff media type returns the pinned base→head diff (ticket 02).
+      if (accept.includes("application/vnd.github.diff")) {
+        if (!this.options.diffText) {
+          this.respond(response, 404, { message: "no diff configured for this fake" });
+          return;
+        }
+        response.statusCode = 200;
+        response.setHeader("content-type", "text/plain; charset=utf-8");
+        response.end(this.options.diffText);
+        return;
+      }
       this.respond(response, 200, {
         number: pull.number,
         state: pull.state,
@@ -308,9 +349,16 @@ export class FakeGitHub {
     this.respond(response, 404, { message: `unrouted: ${method} ${path}` });
   }
 
-  private anchorIsValid(path: string | undefined, side: string | undefined, line: number | undefined): boolean {
-    const key = `${path}#${side ?? "RIGHT"}#${line ?? 0}`;
-    return this.state.diffAnchors.has(key);
+  /** Range-aware anchor check (ticket 02): the end anchor must be in the
+   * diff, and a range start must land there on the same side. */
+  private anchorIsValid(comment: FakeReviewCommentInput): boolean {
+    const side = (comment.side ?? "RIGHT") as "LEFT" | "RIGHT";
+    if (!this.state.diffAnchors.has(`${comment.path}#${side}#${comment.line ?? 0}`)) return false;
+    if (comment.start_line !== undefined) {
+      const startSide = (comment.start_side ?? side) as "LEFT" | "RIGHT";
+      if (!this.state.diffAnchors.has(`${comment.path}#${startSide}#${comment.start_line}`)) return false;
+    }
+    return true;
   }
 
   private handleGraphql(body: string, response: ServerResponse): void {
@@ -376,6 +424,8 @@ export class FakeGitHub {
       path: string;
       side: "LEFT" | "RIGHT";
       line: number;
+      startSide?: "LEFT" | "RIGHT";
+      startLine?: number;
       body: string;
       commitId: string;
       author: string;
@@ -395,7 +445,7 @@ export class FakeGitHub {
 
   private createReview(
     pullNumber: number,
-    parsed: { body?: string; commit_id?: string; event?: string; comments?: Array<{ path: string; side?: string; line?: number; body?: string }> },
+    parsed: { body?: string; commit_id?: string; event?: string; comments?: FakeReviewCommentInput[] },
   ): FakeReview {
     const id = ++this.reviewsSeq;
     const review: FakeReview = {
@@ -414,6 +464,9 @@ export class FakeGitHub {
           path: c.path ?? "",
           side: (c.side ?? "RIGHT") as "LEFT" | "RIGHT",
           line: c.line ?? 0,
+          ...(c.start_line !== undefined
+            ? { startSide: (c.start_side ?? c.side ?? "RIGHT") as "LEFT" | "RIGHT", startLine: c.start_line }
+            : {}),
           body: c.body ?? "",
           commitId: review.commitId,
           author: this.botLogin,
@@ -439,6 +492,9 @@ export class FakeGitHub {
       path: comment.path,
       side: comment.side,
       line: comment.line,
+      ...(comment.startSide !== undefined && comment.startLine !== undefined
+        ? { start_side: comment.startSide, start_line: comment.startLine }
+        : {}),
       body: comment.body,
       commit_id: comment.commitId,
       in_reply_to_id: comment.inReplyToId,

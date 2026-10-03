@@ -53,7 +53,14 @@ export interface GitHubApi {
       commit_id: string;
       event: "COMMENT";
       body: string;
-      comments: Array<{ path: string; side: "LEFT" | "RIGHT"; line: number; body: string }>;
+      comments: Array<{
+        path: string;
+        side: "LEFT" | "RIGHT";
+        line: number;
+        start_side?: "LEFT" | "RIGHT";
+        start_line?: number;
+        body: string;
+      }>;
     },
     signal?: AbortSignal,
   ): Promise<HttpResponse>;
@@ -70,7 +77,15 @@ export interface GitHubApi {
   createReviewComment(
     repository: string,
     pullNumber: number,
-    payload: { commit_id: string; path: string; side: "LEFT" | "RIGHT"; line: number; body: string },
+    payload: {
+      commit_id: string;
+      path: string;
+      side: "LEFT" | "RIGHT";
+      line: number;
+      start_side?: "LEFT" | "RIGHT";
+      start_line?: number;
+      body: string;
+    },
     signal?: AbortSignal,
   ): Promise<HttpResponse>;
   /** All review comments on the pull request (any author). */
@@ -108,6 +123,11 @@ export interface GitHubApi {
     repository: string,
     username: string,
   ): Promise<HttpResponse>;
+  /**
+   * The pull request's unified diff (base→head), the pinned diff anchor
+   * validation checks against (ticket 02). Served with the `diff` media type.
+   */
+  getPullRequestDiff(repository: string, pullNumber: number): Promise<{ status: number; body: string }>;
 }
 
 /** REST response shape used by the publisher. */
@@ -170,16 +190,13 @@ export class Publisher {
   constructor(readonly api: GitHubApi) {}
 
   async checkInProgress(subject: RunDocument["subject"], stage: string): Promise<void> {
-    const response = await this.api.createCheckRun(subject.repository, {
-      name: CHECK_NAME,
-      head_sha: subject.headSha,
-      status: "in_progress",
+    await this.createCheck(subject, {
+      status: "in_progress" as const,
       output: {
         title: "Review in progress",
         summary: `Reviewing ${subject.headSha.slice(0, 12)} · stage: ${stage}`,
       },
-    });
-    this.ensureStatus(response, 201, "check-run start");
+    }, "start");
   }
 
   /** The login that publishes writes as — model-supplied IDs are validated
@@ -420,6 +437,9 @@ export class Publisher {
           path: f.path,
           side: f.side,
           line: f.line,
+          ...(f.startSide !== undefined && f.startLine !== undefined
+            ? { start_side: f.startSide, start_line: f.startLine }
+            : {}),
           body: f.section,
         })),
       },
@@ -453,6 +473,9 @@ export class Publisher {
         path: finding.path,
         side: finding.side,
         line: finding.line,
+        ...(finding.startSide !== undefined && finding.startLine !== undefined
+          ? { start_side: finding.startSide, start_line: finding.startLine }
+          : {}),
         body: finding.section,
       },
       signal,
@@ -469,11 +492,9 @@ export class Publisher {
   }
 
   async checkSuccess(subject: RunDocument["subject"], findingCount: number): Promise<void> {
-    const response = await this.api.createCheckRun(subject.repository, {
-      name: CHECK_NAME,
-      head_sha: subject.headSha,
-      status: "completed",
-      conclusion: "success",
+    await this.createCheck(subject, {
+      status: "completed" as const,
+      conclusion: "success" as const,
       output: {
         title: "Review published",
         summary:
@@ -481,19 +502,32 @@ export class Publisher {
             ? "Complete review: no findings."
             : `Complete review: ${findingCount} finding(s), all advisory.`,
       },
-    });
-    this.ensureStatus(response, 201, "check-run completion");
+    }, "completion");
   }
 
   async checkFailure(subject: RunDocument["subject"], reason: string): Promise<void> {
+    await this.createCheck(subject, {
+      status: "completed" as const,
+      conclusion: "failure" as const,
+      output: { title: "Review failed", summary: reason },
+    }, "completion");
+  }
+
+  private async createCheck(
+    subject: RunDocument["subject"],
+    payload:
+      | { status: "in_progress"; output: { title: string; summary: string } }
+      | { status: "completed"; conclusion: "success" | "failure"; output: { title: string; summary: string } },
+    stage: string,
+  ): Promise<void> {
     const response = await this.api.createCheckRun(subject.repository, {
       name: CHECK_NAME,
       head_sha: subject.headSha,
-      status: "completed",
-      conclusion: "failure",
-      output: { title: "Review failed", summary: reason },
+      ...payload,
     });
-    this.ensureStatus(response, 201, "check-run completion");
+    if (response.status !== 201) {
+      throw new PublishError(`check-run ${stage} failed with HTTP ${response.status}`);
+    }
   }
 
   private ensureStatus(response: HttpResponse, expected: number, what: string): void {

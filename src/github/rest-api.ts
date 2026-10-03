@@ -24,8 +24,9 @@ export class RestGitHubApi implements GitHubApi {
     path: string,
     body?: unknown,
     signal?: AbortSignal,
+    options: { accept?: string; rawText?: boolean } = {},
   ): Promise<{ status: number; body: T }> {
-    return this.send<T>(method, `${this.normalizedBase}${path}`, body, signal);
+    return this.send<T>(method, `${this.normalizedBase}${path}`, body, signal, options);
   }
 
   private async send<T>(
@@ -33,11 +34,12 @@ export class RestGitHubApi implements GitHubApi {
     url: string,
     body?: unknown,
     signal?: AbortSignal,
+    options: { accept?: string; rawText?: boolean } = {},
   ): Promise<{ status: number; body: T }> {
     const response = await fetch(url, {
       method,
       headers: {
-        accept: "application/vnd.github+json",
+        accept: options.accept ?? "application/vnd.github+json",
         authorization: `Bearer ${this.token}`,
         "content-type": "application/json",
         "x-github-api-version": "2022-11-28",
@@ -46,7 +48,7 @@ export class RestGitHubApi implements GitHubApi {
       signal,
     });
     const text = await response.text();
-    const parsed = text ? (JSON.parse(text) as T) : (undefined as T);
+    const parsed = options.rawText ? (text as T) : text ? (JSON.parse(text) as T) : (undefined as T);
     return { status: response.status, body: parsed };
   }
 
@@ -114,5 +116,13 @@ export class RestGitHubApi implements GitHubApi {
       { query, variables },
       signal,
     );
+  }
+
+  /** The PR's unified diff (base→head), served with the `diff` media type. */
+  getPullRequestDiff(repository: string, pullNumber: number) {
+    return this.request<string>("GET", `/repos/${repository}/pulls/${pullNumber}`, undefined, undefined, {
+      accept: "application/vnd.github.diff",
+      rawText: true,
+    });
   }
 }
