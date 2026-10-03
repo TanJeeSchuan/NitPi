@@ -45,7 +45,12 @@ export class ModelStub {
   private scriptIndex = 0;
   readonly requests: RecordedRequest[] = [];
 
-  constructor(private script: StubScript, private modelId: string) {}
+  constructor(
+    private script: StubScript,
+    private modelId: string,
+    /** Test hook: fired before serving each scripted step (0-based). */
+    private onServe?: (requestIndex: number) => void,
+  ) {}
 
   /** True when every scripted step was served. */
   get exhausted(): boolean {
@@ -77,6 +82,7 @@ export class ModelStub {
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const body = await this.readBody(request);
     this.requests.push({ body: JSON.parse(body) });
+    this.onServe?.(this.scriptIndex);
     const step = this.script[this.scriptIndex];
     this.scriptIndex += 1;
     if (!step) {

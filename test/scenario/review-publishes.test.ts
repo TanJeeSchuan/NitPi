@@ -16,7 +16,7 @@ import { tmpdir } from "node:os";
 import { openReviewHost, type ReviewHost } from "../../src/review-host/review-host.js";
 import { FakeGitHub } from "../fixtures/fake-github.js";
 import { ModelStub, type StubScript } from "../fixtures/model-stub.js";
-import { createGitRepoFixture, type GitRepoFixture } from "../fixtures/git-fixture.js";
+import { createGitRepoFixture, unifiedDiff, type GitRepoFixture } from "../fixtures/git-fixture.js";
 
 let workspace: string;
 let repo: GitRepoFixture;
@@ -40,6 +40,8 @@ beforeAll(async () => {
       "src/handler.ts#RIGHT#3",
       "src/handler.ts#RIGHT#5",
     ],
+    // The pinned diff the anchor validator checks against (ticket 02).
+    { diffText: unifiedDiff() },
   );
   githubBase = await fakeGithub.listen();
 });

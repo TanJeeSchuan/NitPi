@@ -23,7 +23,14 @@ export interface GitHubApi {
       commit_id: string;
       event: "COMMENT";
       body: string;
-      comments: Array<{ path: string; side: "LEFT" | "RIGHT"; line: number; body: string }>;
+      comments: Array<{
+        path: string;
+        side: "LEFT" | "RIGHT";
+        line: number;
+        start_side?: "LEFT" | "RIGHT";
+        start_line?: number;
+        body: string;
+      }>;
     },
     signal?: AbortSignal,
   ): Promise<{ status: number; body: unknown }>;
@@ -44,13 +51,17 @@ export interface GitHubApi {
   getCollaboratorPermission(
     repository: string,
     username: string,
-  ): Promise<{ status: number; body: unknown }>
-
+  ): Promise<{ status: number; body: unknown }>;
   /**
    * Check runs at one commit (named-check wait for automatic reviews,
    * ticket 03). Undefined when the transport has no such route.
    */
   listCheckRunsForHead?(repository: string, headSha: string): Promise<{ status: number; body: unknown }>;
+  /**
+   * The pull request's unified diff (base→head), the pinned diff anchor
+   * validation checks against (ticket 02). Served with the `diff` media type.
+   */
+  getPullRequestDiff(repository: string, pullNumber: number): Promise<{ status: number; body: string }>;
 }
 
 export interface PublishedResult {
@@ -85,18 +96,13 @@ export class Publisher {
   constructor(readonly api: GitHubApi) {}
 
   async checkInProgress(subject: RunDocument["subject"], stage: string): Promise<void> {
-    const response = await this.api.createCheckRun(subject.repository, {
-      name: CHECK_NAME,
-      head_sha: subject.headSha,
-      status: "in_progress",
+    await this.createCheck(subject, {
+      status: "in_progress" as const,
       output: {
         title: "Review in progress",
         summary: `Reviewing ${subject.headSha.slice(0, 12)} · stage: ${stage}`,
       },
-    });
-    if (response.status !== 201) {
-      throw new PublishError(`check-run start failed with HTTP ${response.status}`);
-    }
+    }, "start");
   }
 
   /** Publish one advisory review for the reviewed head. Failure = explicit reason. */
@@ -117,6 +123,9 @@ export class Publisher {
           path: f.path,
           side: f.side,
           line: f.line,
+          ...(f.startSide !== undefined && f.startLine !== undefined
+            ? { start_side: f.startSide, start_line: f.startLine }
+            : {}),
           body: f.section,
         })),
       },
@@ -142,11 +151,9 @@ export class Publisher {
   }
 
   async checkSuccess(subject: RunDocument["subject"], findingCount: number): Promise<void> {
-    const response = await this.api.createCheckRun(subject.repository, {
-      name: CHECK_NAME,
-      head_sha: subject.headSha,
-      status: "completed",
-      conclusion: "success",
+    await this.createCheck(subject, {
+      status: "completed" as const,
+      conclusion: "success" as const,
       output: {
         title: "Review published",
         summary:
@@ -154,22 +161,31 @@ export class Publisher {
             ? "Complete review: no findings."
             : `Complete review: ${findingCount} finding(s), all advisory.`,
       },
-    });
-    if (response.status !== 201) {
-      throw new PublishError(`check-run completion failed with HTTP ${response.status}`);
-    }
+    }, "completion");
   }
 
   async checkFailure(subject: RunDocument["subject"], reason: string): Promise<void> {
+    await this.createCheck(subject, {
+      status: "completed" as const,
+      conclusion: "failure" as const,
+      output: { title: "Review failed", summary: reason },
+    }, "completion");
+  }
+
+  private async createCheck(
+    subject: RunDocument["subject"],
+    payload:
+      | { status: "in_progress"; output: { title: string; summary: string } }
+      | { status: "completed"; conclusion: "success" | "failure"; output: { title: string; summary: string } },
+    stage: string,
+  ): Promise<void> {
     const response = await this.api.createCheckRun(subject.repository, {
       name: CHECK_NAME,
       head_sha: subject.headSha,
-      status: "completed",
-      conclusion: "failure",
-      output: { title: "Review failed", summary: reason },
+      ...payload,
     });
     if (response.status !== 201) {
-      throw new PublishError(`check-run completion failed with HTTP ${response.status}`);
+      throw new PublishError(`check-run ${stage} failed with HTTP ${response.status}`);
     }
   }
 

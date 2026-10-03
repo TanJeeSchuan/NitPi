@@ -24,7 +24,7 @@ import { RestGitHubApi } from "../github/rest-api.js";
 import { Publisher } from "../github/publisher.js";
 import { createBridgedProvider } from "../pi-bridge/provider-bridge.js";
 import { ensureStageCheckouts, CheckoutError } from "./checkouts.js";
-import { resolveConfig, type ReviewHostConfig, type AutoModeConfig } from "./config.js";
+import { isFullSha, resolveConfig, type ReviewHostConfig, type AutoModeConfig } from "./config.js";
 import { resolveInstructions } from "./instructions.js";
 import { RunHistory, type RunDocument } from "./run-history.js";
 import {
@@ -168,7 +168,6 @@ export async function openReviewHost(
 
 class ReviewHostImpl implements ReviewHost {
   private activeRuns = new Map<string, Promise<void>>();
-  private canonicalIds = new Map<string, string>();
   /** Per-PR serial chain that serializes gate decisions with run starts. */
   private prQueues = new Map<string, Promise<unknown>>();
   /** Per-PR pending-request drain loops, awaited by drainPendingRequests(). */
@@ -405,8 +404,13 @@ class ReviewHostImpl implements ReviewHost {
       "primary",
     );
 
-    const canonicalKey = prKey(request.repository, request.pullNumber);
-    let canonicalId = this.canonicalIds.get(canonicalKey);
+    // The canonical PR conversation is durable state, shared by every run of
+    // this PR (recovered from the runs registry on reopen).
+    let canonicalId = await this.history.findCanonicalConversation(
+      request.repository,
+      request.pullNumber,
+      TODO_CONTEXT,
+    );
     if (!canonicalId) {
       const primaryInstructions = resolveInstructions("primary", this.config.repositoryInstructions);
       const canonical = await this.history.createCanonicalConversation(
@@ -414,7 +418,6 @@ class ReviewHostImpl implements ReviewHost {
         TODO_CONTEXT,
       );
       canonicalId = canonical.id as unknown as string;
-      this.canonicalIds.set(canonicalKey, canonicalId);
     }
 
     const runId = `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;

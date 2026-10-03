@@ -6,13 +6,14 @@
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { once } from "node:events";
+import { parseUnifiedDiffAnchors } from "../../src/review-host/anchor-validation.js";
 
 export interface FakePullRequest {
   number: number;
   headSha: string;
   baseSha: string;
   state: "open" | "closed";
-  /** Draft pull requests get no automatic review. */
+  /** Draft pull requests get no automatic review (ticket 03). */
   draft?: boolean;
   /** Head repository full name; differs from `baseRepo` on fork pulls. */
   headRepo?: string;
@@ -33,6 +34,8 @@ export interface FakeReview {
     path: string;
     side: "LEFT" | "RIGHT";
     line: number;
+    startSide?: "LEFT" | "RIGHT";
+    startLine?: number;
     body: string;
     commitId: string;
   }>;
@@ -49,10 +52,20 @@ export interface FakeGitHubState {
   /** 422 detail for malformed anchors. */
   validationErrors: Map<string, string>;
   /**
-   * External check status per head SHA (named-check wait). Keyed
-   * `headSha|name` → "in_progress" | "completed" (+ conclusion).
+   * External check status per head SHA (ticket 03's named-check wait).
+   * Keyed `headSha|name` → "in_progress" | "completed:success" | "completed:failure"
+   * | "completed:neutral".
    */
   externalChecks: Map<string, "in_progress" | "completed:success" | "completed:failure" | "completed:neutral">;
+}
+
+export interface FakeReviewCommentInput {
+  path?: string;
+  side?: string;
+  line?: number;
+  start_side?: string;
+  start_line?: number;
+  body?: string;
 }
 
 export class FakeGitHub {
@@ -63,7 +76,11 @@ export class FakeGitHub {
   private reviewsSeq = 100;
   private commentsSeq = 1000;
 
-  constructor(readonly pulls: FakePullRequest[], readonly diffAnchors: string[] = []) {
+  constructor(
+    readonly pulls: FakePullRequest[],
+    readonly diffAnchors: string[] = [],
+    readonly options: { diffText?: string } = {},
+  ) {
     this.state = {
       pulls: Object.fromEntries(pulls.map((p) => [p.number, p])),
       diffAnchors: new Set(diffAnchors),
@@ -73,6 +90,22 @@ export class FakeGitHub {
       validationErrors: new Map(),
       externalChecks: new Map(),
     };
+    // When the fake serves a PR diff, its validation set derives from that
+    // diff (GitHub is the authority; the host validates against the same
+    // pinned diff it fetches from here).
+    if (options.diffText) {
+      for (const anchor of parseUnifiedDiffAnchors(options.diffText).entries()) {
+        this.state.diffAnchors.add(`${anchor.path}#${anchor.side}#${anchor.line}`);
+      }
+    }
+  }
+
+  /** Serve a different PR diff from now on; its anchors union in. */
+  setPullDiff(diffText: string): void {
+    (this.options as { diffText?: string }).diffText = diffText;
+    for (const anchor of parseUnifiedDiffAnchors(diffText).entries()) {
+      this.state.diffAnchors.add(`${anchor.path}#${anchor.side}#${anchor.line}`);
+    }
   }
 
   async listen(): Promise<string> {
@@ -116,8 +149,9 @@ export class FakeGitHub {
       return;
     }
     const body = ["POST", "PATCH", "PUT"].includes(request.method ?? "") ? await this.readBody(request) : "";
+    const accept = String(request.headers.accept ?? "");
     try {
-      this.route(request.method ?? "GET", path, body, response);
+      this.route(request.method ?? "GET", path, body, response, accept);
     } catch (error) {
       this.respond(response, 500, { message: String(error) });
     }
@@ -127,24 +161,28 @@ export class FakeGitHub {
     // Mirrors route() writes for the drop scenario without a response.
     const prMatch = path.match(/^\/repos\/[^/]+\/[^/]+\/pulls\/(\d+)\/reviews$/);
     if (prMatch) {
-      const parsed = JSON.parse(body) as { body?: string; commit_id?: string; comments?: Array<{ path: string; side?: string; line?: number; body?: string }> };
+      const parsed = JSON.parse(body) as { body?: string; commit_id?: string; comments?: FakeReviewCommentInput[] };
       this.createReview(Number(prMatch[1]), parsed);
     }
   }
 
-  private route(method: string, path: string, body: string, response: ServerResponse): void {
+  private route(method: string, path: string, body: string, response: ServerResponse, accept = ""): void {
     const prMatch = path.match(/^\/repos\/[^/]+\/[^/]+\/pulls\/(\d+)\/reviews$/);
     if (method === "POST" && prMatch) {
       const parsed = JSON.parse(body) as {
         body?: string;
         commit_id?: string;
         event?: string;
-        comments?: Array<{ path: string; side?: string; line?: number; body?: string }>;
+        comments?: FakeReviewCommentInput[];
       };
       const bad = parsed.comments?.find((c) => {
         const side = (c.side ?? "RIGHT") as "LEFT" | "RIGHT";
-        const key = `${c.path}#${side}#${c.line}`;
-        return !this.state.diffAnchors.has(key);
+        if (!this.state.diffAnchors.has(`${c.path}#${side}#${c.line}`)) return true;
+        if (c.start_line !== undefined) {
+          const startSide = (c.start_side ?? side) as "LEFT" | "RIGHT";
+          if (!this.state.diffAnchors.has(`${c.path}#${startSide}#${c.start_line}`)) return true;
+        }
+        return false;
       });
       if (bad) {
         this.respond(response, 422, { message: "Validation Failed", detail: `invalid anchor: ${bad.path}:${bad.line}` });
@@ -186,6 +224,17 @@ export class FakeGitHub {
         this.respond(response, 404, { message: "Not Found" });
         return;
       }
+      // The diff media type returns the pinned base→head diff (ticket 02).
+      if (accept.includes("application/vnd.github.diff")) {
+        if (!this.options.diffText) {
+          this.respond(response, 404, { message: "no diff configured for this fake" });
+          return;
+        }
+        response.statusCode = 200;
+        response.setHeader("content-type", "text/plain; charset=utf-8");
+        response.end(this.options.diffText);
+        return;
+      }
       const repo = { full_name: pull.headRepo ?? pull.baseRepo ?? "example/widgets" };
       const baseRepo = { full_name: pull.baseRepo ?? "example/widgets" };
       this.respond(response, 200, {
@@ -198,6 +247,7 @@ export class FakeGitHub {
       return;
     }
 
+    // Check runs at one commit: the named-check wait reads this (ticket 03).
     const checkRunsMatch = path.match(/^\/repos\/[^/]+\/[^/]+\/commits\/([0-9a-f]+)\/check-runs$/);
     if (method === "GET" && checkRunsMatch) {
       const headSha = checkRunsMatch[1] ?? "";
@@ -227,7 +277,7 @@ export class FakeGitHub {
     this.respond(response, 404, { message: `unrouted: ${method} ${path}` });
   }
 
-  private createReview(pullNumber: number, parsed: { body?: string; commit_id?: string; event?: string; comments?: Array<{ path: string; side?: string; line?: number; body?: string }> }): FakeReview {
+  private createReview(pullNumber: number, parsed: { body?: string; commit_id?: string; event?: string; comments?: FakeReviewCommentInput[] }): FakeReview {
     const id = ++this.reviewsSeq;
     const review: FakeReview = {
       id,
@@ -237,9 +287,12 @@ export class FakeGitHub {
       body: parsed.body ?? "",
       comments: (parsed.comments ?? []).map((c) => ({
         id: ++this.commentsSeq,
-        path: c.path,
+        path: c.path ?? "",
         side: (c.side ?? "RIGHT") as "LEFT" | "RIGHT",
         line: c.line ?? 0,
+        ...(c.start_line !== undefined
+          ? { startSide: (c.start_side ?? c.side ?? "RIGHT") as "LEFT" | "RIGHT", startLine: c.start_line }
+          : {}),
         body: c.body ?? "",
         commitId: parsed.commit_id ?? "",
       })),
