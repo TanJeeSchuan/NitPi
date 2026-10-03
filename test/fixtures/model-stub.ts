@@ -43,14 +43,27 @@ export interface RecordedRequest {
 export class ModelStub {
   private server: Server | undefined;
   private scriptIndex = 0;
+  private script: StubScript;
   readonly requests: RecordedRequest[] = [];
 
+  /** Test hook: fired before serving each scripted step (0-based). */
+  private readonly onServe?: (requestIndex: number) => void;
+
   constructor(
-    private script: StubScript,
+    script: StubScript,
     private modelId: string,
-    /** Test hook: fired before serving each scripted step (0-based). */
-    private onServe?: (requestIndex: number) => void,
-  ) {}
+    onServe?: (requestIndex: number) => void,
+  ) {
+    this.script = [...script];
+    this.onServe = onServe;
+  }
+
+  /** Append a step (e.g. a rerun turn scripted once earlier runs' outcomes
+   * such as real comment IDs are known). The server serves steps in order,
+   * reading the script live, so appended steps are served next. */
+  append(step: StubTurn | StubError): void {
+    this.script.push(step);
+  }
 
   /** True when every scripted step was served. */
   get exhausted(): boolean {

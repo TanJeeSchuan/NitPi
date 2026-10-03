@@ -19,18 +19,29 @@ import {
   type Tx,
 } from "@earendil-works/pi-durable";
 import type { ReviewFinding } from "./artifact.js";
+import type { FindingMatch, MatchRejection, PublishedComment } from "./matching.js";
 
 export type RunPhase =
   | "primary"
   | "primary frozen"
   | "re-review"
   | "final frozen"
+  | "matched"
   | "publishing"
   | "published";
 
+/** Token usage of one settling assistant message. */
+export interface StageUsage {
+  input: number;
+  output: number;
+  totalTokens: number;
+}
+
 export interface RunUsage {
-  primary?: { input: number; output: number; totalTokens: number };
-  reReview?: { input: number; output: number; totalTokens: number };
+  primary?: StageUsage;
+  reReview?: StageUsage;
+  /** The post-freeze matching turn (ticket 04). */
+  matching?: StageUsage;
 }
 
 export interface RunDocument {
@@ -63,6 +74,14 @@ export interface RunDocument {
   pinnedDiff?: string;
   reReviewConversationId?: string;
   publication?: { reviewId: number; commentIds: number[] };
+  /** Review-comment snapshot (any author) read at matching time — the input
+   * the matching turn saw and the set the publisher validates against. */
+  earlierComments?: PublishedComment[];
+  /** Raw model assignments from the matching turn (label → comment id or null). */
+  matches?: FindingMatch[];
+  /** Model-supplied IDs rejected at publication, with reasons (ticket 04:
+   * rejected with a reason and not acted on). */
+  matchRejections?: MatchRejection[];
   /** The instructions each stage actually used, by content hash. */
   instructionHashes?: { primary?: string; reReview?: string };
   /** Pinned revision the repository instructions were captured at. */
