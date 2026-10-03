@@ -318,7 +318,9 @@ export class Publisher {
   /** The bot's summary review for THIS run: the review whose body carries
    * this run's summary marker. Falls back to the bot's newest review when no
    * marker is present (runs published before ticket 05). When it exists, a
-   * rerun PATCHes it instead of adding another summary. */
+   * rerun PATCHes it instead of adding another summary. A recorded-but-
+   * unconfirmed create operation whose object is on GitHub is adopted here:
+   * the durable intent gets its remote ID without a second create. */
   private async botSummaryReview(
     subject: RunDocument["subject"],
     botLogin: string,
@@ -333,10 +335,36 @@ export class Publisher {
       const id = raw.id as number;
       if (authorLogin(raw) !== botLogin || typeof id !== "number") continue;
       const candidate = { id, body: (raw.body as string) ?? "" };
-      if (extractMarkers(candidate.body).includes(marker)) return candidate;
+      if (extractMarkers(candidate.body).includes(marker)) {
+        await this.adoptRecordedCreate(runId, candidate, raw);
+        return candidate;
+      }
       if (!newest || id > newest.id) newest = candidate;
     }
     return newest;
+  }
+
+  /** Adopt the run's recorded-but-unconfirmed create-review operation when
+   * the review it intended is on GitHub (marker + reviewed subject). */
+  private async adoptRecordedCreate(
+    runId: string,
+    review: { id: number; body: string },
+    raw: Record<string, unknown>,
+  ): Promise<void> {
+    const hooks = this.ledgerHooks;
+    if (!hooks) return;
+    const opKey = operationKey("create-review", runId, "summary");
+    const op = await hooks.ledger.op(opKey, hooks.context);
+    if (!op || op.state === "confirmed") return;
+    if (!recordMatchesRemote(
+      op,
+      { bodyMarkers: extractMarkers(review.body), commitId: (raw.commit_id as string) ?? "", authorLogin: (raw.user as { login?: string })?.login ?? "" },
+      (raw.user as { login?: string })?.login ?? "",
+    )) {
+      return;
+    }
+    const inlineIds = ((raw.comments as Array<{ id: number }> | undefined) ?? []).map((c) => c.id);
+    await hooks.ledger.confirmFromState(opKey, { reviewId: review.id, commentIds: inlineIds }, hooks.context);
   }
 
   /** GraphQL thread state keyed by the database ID of any comment in the
@@ -423,15 +451,19 @@ export class Publisher {
 
     // Fresh live state for write decisions (ticket 05): a comment the
     // matching snapshot knew that GitHub no longer has was deleted by hand —
-    // reconciled against this listing before anything is recreated.
-    const liveComments = earlier.length > 0 ? await this.listPublishedComments(subject) : earlier;
+    // reconciled against this listing before anything is recreated. With the
+    // ledger installed the listing always runs: recovery reconciles recorded
+    // operations against it before any write.
+    const liveComments =
+      earlier.length > 0 || this.ledgerHooks !== undefined
+        ? await this.listPublishedComments(subject)
+        : earlier;
     const liveById = new Map(liveComments.map((c) => [c.id, c]));
 
     // One maintained summary: update the bot's review for this run when it
     // exists (marker match, ticket 05), else the newest bot review (runs
     // published before markers did).
     const summaryReview = await this.botSummaryReview(subject, botLogin, runId);
-
     // Sync mode when the run must not blanket-post findings inline: a bot
     // summary already exists, or earlier bot comments exist to match against
     // (even when the summary review is gone, its replacements may remain).
@@ -488,9 +520,22 @@ export class Publisher {
         const matchedId = matchByLabel.get(finding.label);
         if (matchedId === undefined || !liveById.has(matchedId)) {
           // No match, or the matched comment was deleted by hand between the
-          // matching snapshot and this write: the fresh listing above is the
-          // reconciliation — it is only recreated now that GitHub's actual
-          // state shows it absent (ticket 05).
+          // matching snapshot and this write. First reconcile the finding's
+          // own marker: a comment of this run already carrying it (an inline
+          // comment adopted with a recovered review) is reused as-is instead
+          // of being posted a second time (ticket 05).
+          const own = liveComments.find(
+            (c) =>
+              c.author === botLogin &&
+              extractMarkers(c.body).includes(findingMarker(runId, finding.label)) &&
+              c.path === finding.path &&
+              c.side === finding.side &&
+              c.line === finding.line,
+          );
+          if (own) {
+            commentIds.push(own.id);
+            continue;
+          }
           commentIds.push(await this.postComment(subject, finding, runId, signal));
           continue;
         }
