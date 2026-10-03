@@ -92,12 +92,10 @@ const MANUAL_AUTO_MODE: AutoModeConfig = {
 };
 
 /**
- * The named-check verifier for automatic reviews. GitHub's combined status
- * and check-run surfaces sit with the workflow (ticket 11's runner); the
- * host takes the check names from the automatic-mode configuration and needs
- * an implementation over `GitHubApi`. This host answers with what the fake
- * (or real) GitHub exposes through a config-supplied `waitChecks` probe; the
- * absence of one means "no checks to wait for".
+ * Named-check probe for automatic reviews: every check named in the
+ * automatic-mode configuration must be completed on the head before the
+ * review starts. The host's probe reads the check-runs surface at the head
+ * commit over `GitHubApi`; the workflow (ticket 11) supplies the transport.
  */
 export type NamedCheckProbe = (
   repository: string,
@@ -269,13 +267,22 @@ class ReviewHostImpl implements ReviewHost {
   ): Promise<void> {
     if (this.config.refusalCheckBehavior === "none") return;
     const repository = event.repository;
-    const headSha = evaluation.headSha;
+    let headSha = evaluation.headSha;
+    let baseSha = evaluation.baseSha;
+    // Refusals decided before the pull request was read (the requester
+    // check) still show their reason at the pull request's head.
+    if (!headSha) {
+      const pr = await this.api.getPullRequest(repository, event.pullNumber);
+      const body = (pr.body ?? {}) as { head?: { sha?: string }; base?: { sha?: string } };
+      headSha = body.head?.sha;
+      baseSha = body.base?.sha;
+    }
     if (!headSha || !/^[0-9a-f]{40}$/i.test(headSha)) return;
     const outcome = evaluation.checkOutcome === "skipped" && this.config.refusalCheckBehavior === "action_required"
       ? "action_required" as const
       : evaluation.checkOutcome;
     await new Publisher(this.api).checkRefused(
-      { repository, pullNumber: event.pullNumber, baseSha: evaluation.baseSha ?? "", headSha },
+      { repository, pullNumber: event.pullNumber, baseSha: baseSha ?? "", headSha },
       outcome as RefusalOutcome,
       evaluation.reason,
     );
@@ -301,12 +308,28 @@ class ReviewHostImpl implements ReviewHost {
    */
   private async drainLoop(repository: string, pullNumber: number): Promise<void> {
     for (let attempt = 0; attempt < DRAIN_MAX_ATTEMPTS; attempt++) {
+      // Outside the chain: wait out any active run of this pull request.
+      const activePromises: Promise<void>[] = [];
+      for (const [runId, promise] of this.activeRuns) {
+        const run = await this.history.findRun(runId, TODO_CONTEXT);
+        if (
+          run &&
+          run.subject.repository === repository &&
+          run.subject.pullNumber === pullNumber
+        ) {
+          activePromises.push(promise);
+        }
+      }
+      if (activePromises.length > 0) {
+        await Promise.allSettled(activePromises);
+        continue;
+      }
       const decided = await this.enqueue(repository, pullNumber, () =>
         this.evaluateAndStartPending(repository, pullNumber),
       );
       if (decided === "started") {
-        // Wait for the run that just started before looking again; the run's
-        // own bookkeeping kicked another drain if a request was queued later.
+        // A run just started; its completion kicks another drain if a request
+        // was queued while it ran.
         return;
       }
       if (decided === "deferred") {
@@ -317,7 +340,9 @@ class ReviewHostImpl implements ReviewHost {
     }
   }
 
-  /** One drain decision inside the PR's serialized chain. */
+  /** One drain decision inside the PR's serialized chain. It never waits on
+   * an active run — the chain must stay free for other triggers — an active
+   * run is reported as "deferred" and the loop re-checks after sleeping. */
   private async evaluateAndStartPending(
     repository: string,
     pullNumber: number,
@@ -325,18 +350,13 @@ class ReviewHostImpl implements ReviewHost {
     const key = prKey(repository, pullNumber);
     // An active run for this PR holds the pending request; nothing starts
     // until it finishes (its completion re-kicks this loop).
-    for (const [runId, promise] of this.activeRuns) {
-      const run = await this.history.findRun(runId, TODO_CONTEXT);
-      if (
-        run &&
-        run.subject.repository === repository &&
-        run.subject.pullNumber === pullNumber &&
-        run.checkStatus === "in progress"
-      ) {
-        await promise;
-        return "deferred"; // re-evaluate the pending request after the run
-      }
-    }
+    const inProgress = (await this.history.allRuns(TODO_CONTEXT)).find(
+      (r) =>
+        r.subject.repository === repository &&
+        r.subject.pullNumber === pullNumber &&
+        r.checkStatus === "in progress",
+    );
+    if (inProgress) return "deferred";
     const evaluation = await this.gate.evaluatePending(repository, pullNumber, this.namedCheckWait());
     switch (evaluation.outcome) {
       case "start":
@@ -394,7 +414,7 @@ class ReviewHostImpl implements ReviewHost {
     request: GateStart,
     deliveryKey: string,
     options: { pendingKey?: string } = {},
-  ): Promise<{ runId: string; conversationId: string }> {
+  ): Promise<{ runId: string; conversationId: string; outcome: "start" }> {
     // Per-stage unchanged checkouts of the reviewed head.
     const checkouts = ensureStageCheckouts(this.config.headCheckoutSource, request.headSha);
 
@@ -467,7 +487,7 @@ class ReviewHostImpl implements ReviewHost {
         checkDetail: "stage: primary",
         checkouts,
         triggeredBy: request.triggeredBy,
-        requester: request.requester,
+        ...(request.requester ? { requester: request.requester } : {}),
         repositoryInstructionsRevision: this.config.repositoryInstructionsRevision,
       };
       await this.history.record(tx, run);
@@ -475,7 +495,7 @@ class ReviewHostImpl implements ReviewHost {
     }, TODO_CONTEXT);
 
     this.run(started.taskId as unknown as string, started.runId, request.repository, request.pullNumber);
-    return { runId: started.runId, conversationId: canonicalId! };
+    return { runId: started.runId, conversationId: canonicalId!, outcome: "start" as const };
   }
 
   /** Track one run to terminal state, then kick the PR's pending drain. */

@@ -450,6 +450,12 @@ export class TriggerGate {
       return { outcome: "queued", deliveryKey };
     }
 
+    // An automatic review runs at most once per head: a run for this head
+    // (any status) already covers it.
+    if (await this.findRunAnyStatus(event.repository, event.pullNumber, headSha)) {
+      return { outcome: "ignored", reason: "a run for this head already exists" };
+    }
+
     return {
       outcome: "start",
       deliveryKey,
