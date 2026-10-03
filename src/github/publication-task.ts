@@ -78,14 +78,15 @@ export const publicationTask = defineTask<PublishTaskInput, PublishCheckpoint, P
           runDoc.matches ?? [],
           context.abortSignal,
         );
-        await commitRunPublication(host, runDoc, context, {
+        await commitRunPublication(host, runDoc.runId, context, (run) => ({
+          ...run,
           publication: { reviewId: published.reviewId, commentIds: published.commentIds },
-          publicationOutcome: "published",
+          publicationOutcome: "published" as const,
           matchRejections: published.rejections,
           phase: "published",
           checkStatus: "success",
           checkDetail: `published review ${published.reviewId} with ${runDoc.findings?.length ?? 0} finding(s)`,
-        });
+        }), { missing: "throw" });
         await publisher.checkSuccess(runDoc.subject, runDoc.findings?.length ?? 0);
         await runtime.commit(
           () => ({
@@ -101,7 +102,7 @@ export const publicationTask = defineTask<PublishTaskInput, PublishCheckpoint, P
         if (runtime.signal.aborted) return; // Killed runner records nothing; the durable checkpoint stands.
         const reason = error instanceof Error ? error.message : String(error);
         const unknown = error instanceof WriteOutcomeUnknown;
-        await commitRunPublicationSafe(host, runDoc, context, (run) => ({
+        await commitRunPublication(host, runDoc.runId, context, (run) => ({
           ...run,
           publicationOutcome: unknown ? "unknown" : "failed",
           checkStatus: "failure",
@@ -109,7 +110,7 @@ export const publicationTask = defineTask<PublishTaskInput, PublishCheckpoint, P
             ? `publication outcome unknown: ${reason} (reconciled on the next retry, never re-created blind)`
             : `publication failed: ${reason} (retry publishes the completed review with no new model calls)`,
           error: reason,
-        }));
+        }), { missing: "skip", tolerateFailure: true });
         if (unknown) {
           await publisher.checkIncomplete(runDoc.subject, `publication outcome unknown: ${reason}`);
         } else {
@@ -127,15 +128,15 @@ export const publicationTask = defineTask<PublishTaskInput, PublishCheckpoint, P
     },
   },
   abort: async (task, runtime, context) => {
-    // Cancellation fence (ticket 09's contract, honored here): an aborted
-    // publication publishes nothing. Any write whose outcome is already
-    // unknown stays unknown in the ledger; recovery never restarts a
-    // cancelled run.
-    await commitRunPublicationSafe(reviewTaskDeps(), { runId: task.input.runId } as RunDocument, context, (run) => ({
+    // The abort protocol pi-durable requires: an aborted publication
+    // publishes nothing and commits a terminal outcome. Any write whose
+    // outcome is already unknown stays unknown in the ledger; ticket 09
+    // refines the cancellation fence and recovery rules around this.
+    await commitRunPublication(reviewTaskDeps(), task.input.runId, context, (run) => ({
       ...run,
       checkStatus: "failure",
       checkDetail: run.checkDetail ?? "publication canceled before completion",
-    }));
+    }), { missing: "skip", tolerateFailure: true });
     await runtime.commit(
       () => ({ status: "terminal" as const, outcome: { status: "aborted" as const, reason: "publication canceled" } }) as const,
       context,
@@ -144,36 +145,32 @@ export const publicationTask = defineTask<PublishTaskInput, PublishCheckpoint, P
   hooks: {},
 });
 
+/**
+ * Record the publication outcome on the run document in one transaction.
+ * The `policy` decides the two failure postures the outcome paths need: the
+ * success path throws when the run is unreadable (storage down is the
+ * execution failure itself), and the failure/abort paths skip a missing run
+ * and swallow storage faults so the original reason is never masked.
+ */
 async function commitRunPublication(
   host: ReturnType<typeof reviewTaskDeps>,
-  runDoc: RunDocument,
-  context: Context,
-  patch: Partial<RunDocument>,
-): Promise<void> {
-  await host.runHistory.harness.commit(async (tx) => {
-    const current = await host.runHistory.findRunInTx(tx, runDoc.runId);
-    if (!current) throw new Error(`run ${runDoc.runId} missing while recording publication`);
-    await host.runHistory.record(tx, { ...current, ...patch });
-  }, context);
-}
-
-/** Same, but storage being down must not mask the publication failure: the
- * run document update is best-effort (an execution failure is already the
- * state of the world when the service is unreachable). */
-async function commitRunPublicationSafe(
-  host: ReturnType<typeof reviewTaskDeps>,
-  runDoc: RunDocument,
+  runId: string,
   context: Context,
   mutate: (run: RunDocument) => RunDocument,
+  policy: { missing: "throw" | "skip"; tolerateFailure?: boolean },
 ): Promise<void> {
   try {
     await host.runHistory.harness.commit(async (tx) => {
-      const current = await host.runHistory.findRunInTx(tx, runDoc.runId);
-      if (!current) return;
+      const current = await host.runHistory.findRunInTx(tx, runId);
+      if (!current) {
+        if (policy.missing === "skip") return;
+        throw new Error(`run ${runId} missing while recording publication`);
+      }
       await host.runHistory.record(tx, mutate(current));
     }, context);
-  } catch {
-    // The task still fails with the reason; storage recovery reopens it.
+  } catch (error) {
+    if (policy.tolerateFailure) return; // The task still fails with the reason; storage recovery reopens it.
+    throw error;
   }
 }
 

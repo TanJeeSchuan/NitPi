@@ -36,7 +36,6 @@ import type { InlineLocation, ReviewFinding, DiffSide } from "../review-host/art
 import type { Context } from "@earendil-works/chord";
 import type { RunDocument } from "../review-host/run-history.js";
 import {
-  isSupersededComment,
   validateMatches,
   SUPERSEDED_MARKER_PREFIX,
   type FindingMatch,
@@ -62,8 +61,9 @@ import {
   readAllReviewComments,
   readAllReviews,
   readThreadPages,
+  matchesPublished,
   recordMatchesRemote,
-  type ReconcileComment,
+  type PaginatedRead,
   type ReconcileReview,
 } from "./publication-reads.js";
 
@@ -95,6 +95,25 @@ export type ReconcileResult =
   | { status: "retry" }
   | { status: "unknown"; detail?: string };
 
+/** The listing-based reconciliation skeleton shared by every write kind
+ * (ticket 05): adopt the matching object when the listing shows it, prove
+ * absence when a complete listing lacks it, stay unknown when the listing
+ * itself cannot be read. */
+function reconcileListing<T>(
+  read: () => Promise<PaginatedRead<T>>,
+  what: string,
+  match: (item: T) => PublicationRemote | undefined,
+): Promise<ReconcileResult> {
+  return read().then((result) => {
+    if (!result.ok) return { status: "unknown" as const, detail: `${what} failed with HTTP ${result.status}` };
+    for (const item of result.items) {
+      const remote = match(item);
+      if (remote) return { status: "confirmed" as const, remote };
+    }
+    return { status: "not_found" as const };
+  });
+}
+
 /** Bounded reconciliation rounds after a lost response. */
 const MAX_LOST_RESPONSE_ROUNDS = 3;
 /** Bounded paced retries for one rate-limited write (exponential waits). */
@@ -107,7 +126,7 @@ function sleepMs(ms: number): Promise<void> {
 /** A body rewritten with every given marker comment appended (missing ones
  * only): updated bodies keep every earlier marker so each run's unconfirmed
  * operation can still find its object after a later run's update. */
-function bodyWithMarkers(body: string, markers: readonly string[]): string {
+function bodyWithAllMarkers(body: string, markers: readonly string[]): string {
   let result = body;
   for (const marker of markers) result = bodyWithMarker(result, marker);
   return result;
@@ -296,22 +315,21 @@ export class Publisher {
     return login;
   }
 
-  /** All review comments on the pull request (any author), as read from
-   * GitHub. This is the matching turn's input snapshot. */
+  /** All review comments on the pull request (any author), read with
+   * pagination (ticket 05). This is the matching turn's input snapshot. */
   async listPublishedComments(subject: RunDocument["subject"]): Promise<PublishedComment[]> {
-    const response = await this.api.listReviewComments(subject.repository, subject.pullNumber);
-    this.ensureStatus(response, 200, "listing review comments");
-    const body = response.body as Array<Record<string, unknown>>;
-    return body.map((raw) => ({
-      id: raw.id as number,
-      path: (raw.path as string) ?? "",
-      side: ((raw.side as string) ?? "RIGHT") as DiffSide,
-      line: (raw.line as number) ?? 0,
-      body: (raw.body as string) ?? "",
-      author: authorLogin(raw as { user?: { login?: string } }),
-      // Durable state carries strict JSON: keep the reply link only when the
-      // comment actually has one.
-      ...(raw.in_reply_to_id != null ? { inReplyToId: raw.in_reply_to_id as number } : {}),
+    const read = await readAllReviewComments(this.api, subject.repository, subject.pullNumber);
+    if (!read.ok) {
+      throw new PublishError(`listing review comments failed with HTTP ${read.status}`);
+    }
+    return read.items.map((item) => ({
+      id: item.id,
+      path: item.path,
+      side: item.side as DiffSide,
+      line: item.line,
+      body: item.body,
+      author: item.authorLogin,
+      ...(item.inReplyToId !== undefined ? { inReplyToId: item.inReplyToId } : {}),
     }));
   }
 
@@ -320,59 +338,61 @@ export class Publisher {
    * marker is present (runs published before ticket 05). When it exists, a
    * rerun PATCHes it instead of adding another summary. A recorded-but-
    * unconfirmed create operation whose object is on GitHub is adopted here:
-   * the durable intent gets its remote ID without a second create. */
+   * the durable intent gets its remote ID without a second create. Reads
+   * with pagination (ticket 05). */
   private async botSummaryReview(
     subject: RunDocument["subject"],
     botLogin: string,
     runId: string,
   ): Promise<{ id: number; body: string } | undefined> {
-    const response = await this.api.listReviews(subject.repository, subject.pullNumber);
-    this.ensureStatus(response, 200, "listing reviews");
-    const body = response.body as Array<Record<string, unknown>>;
+    const read = await readAllReviews(this.api, subject.repository, subject.pullNumber);
+    if (!read.ok) {
+      throw new PublishError(`listing reviews failed with HTTP ${read.status}`);
+    }
     const marker = summaryMarker(runId);
     let newest: { id: number; body: string } | undefined;
-    for (const raw of body) {
-      const id = raw.id as number;
-      if (authorLogin(raw) !== botLogin || typeof id !== "number") continue;
-      const candidate = { id, body: (raw.body as string) ?? "" };
-      if (extractMarkers(candidate.body).includes(marker)) {
-        await this.adoptRecordedCreate(runId, candidate, raw);
+    for (const review of read.items) {
+      // Only the reviewer bot's reviews are summary candidates (ticket 04:
+      // other people's comments are never touched).
+      if (review.authorLogin !== botLogin) continue;
+      const candidate = { id: review.id, body: review.body };
+      if (matchesPublished(review, botLogin, subject.headSha, [marker])) {
+        await this.adoptRecordedCreate(runId, candidate, review, botLogin);
         return candidate;
       }
-      if (!newest || id > newest.id) newest = candidate;
+      if (!newest || review.id > newest.id) newest = candidate;
     }
     return newest;
   }
 
   /** Adopt the run's recorded-but-unconfirmed create-review operation when
-   * the review it intended is on GitHub (marker + reviewed subject). */
+   * the review it intended is on GitHub (marker, author, reviewed subject). */
   private async adoptRecordedCreate(
     runId: string,
     review: { id: number; body: string },
-    raw: Record<string, unknown>,
+    read: ReconcileReview,
+    botLogin: string,
   ): Promise<void> {
     const hooks = this.ledgerHooks;
     if (!hooks) return;
     const opKey = operationKey("create-review", runId, "summary");
     const op = await hooks.ledger.op(opKey, hooks.context);
     if (!op || op.state === "confirmed") return;
-    if (!recordMatchesRemote(
-      op,
-      { bodyMarkers: extractMarkers(review.body), commitId: (raw.commit_id as string) ?? "", authorLogin: (raw.user as { login?: string })?.login ?? "" },
-      (raw.user as { login?: string })?.login ?? "",
-    )) {
-      return;
-    }
-    const inlineIds = ((raw.comments as Array<{ id: number }> | undefined) ?? []).map((c) => c.id);
+    if (!recordMatchesRemote(op, read, botLogin)) return;
+    const inlineIds = read.commentIds ?? [];
     await hooks.ledger.confirmFromState(opKey, { reviewId: review.id, commentIds: inlineIds }, hooks.context);
   }
 
   /** GraphQL thread state keyed by the database ID of any comment in the
-   * thread, read with pagination (ticket 05: list and paginate). */
+   * thread, read with pagination (ticket 05: list and paginate). An
+   * unreadable thread listing fails the publication with a reason. */
   private async loadThreadMap(subject: RunDocument["subject"]): Promise<Map<number, ThreadInfo>> {
-    const threads = await readThreadPages(this.api, subject.repository, subject.pullNumber);
+    const read = await readThreadPages(this.api, subject.repository, subject.pullNumber);
+    if (!read.ok) {
+      throw new PublishError(`the review-threads listing failed with HTTP ${read.status}`);
+    }
     const map = new Map<number, ThreadInfo>();
-    for (const thread of threads) {
+    for (const thread of read.items) {
       for (const comment of thread.comments.nodes) {
         map.set(comment.databaseId, { threadId: thread.id, isResolved: thread.isResolved });
       }
@@ -410,8 +430,11 @@ export class Publisher {
         return { ok: true, remote: {} };
       },
       reconcile: async () => {
-        const threads = await readThreadPages(this.api, subject.repository, subject.pullNumber);
-        const thread = threads.find((t) => t.id === threadId);
+        const read = await readThreadPages(this.api, subject.repository, subject.pullNumber);
+        if (!read.ok) {
+          return { status: "unknown" as const, detail: `the review-threads listing failed with HTTP ${read.status}` };
+        }
+        const thread = read.items.find((t) => t.id === threadId);
         if (!thread) return { status: "not_found" as const };
         if (thread.isResolved === resolved) return { status: "confirmed" as const, remote: {} };
         return { status: "retry" as const };
@@ -487,15 +510,16 @@ export class Publisher {
           response.status === 200
             ? { ok: true, remote: { reviewId: summaryReview.id } }
             : { ok: false, reason: `updating the summary review ${summaryReview.id} failed with HTTP ${response.status}: ${describeBody(response.body)}` },
-        reconcile: async () => {
-          const read = await readAllReviews(this.api, subject.repository, subject.pullNumber);
-          if (!read.ok) return { status: "unknown" as const, detail: `listing reviews failed (HTTP ${read.status})` };
-          const found = read.items.find(
-            (r) => r.id === summaryReview.id && extractMarkers(r.body).includes(summaryMarker(runId)),
-          );
-          if (found) return { status: "confirmed" as const, remote: { reviewId: found.id } };
-          return { status: "not_found" as const };
-        },
+        reconcile: () =>
+          reconcileListing(
+            () => readAllReviews(this.api, subject.repository, subject.pullNumber),
+            "listing reviews",
+            (r) =>
+              r.id === summaryReview.id &&
+              matchesPublished(r, botLogin, subject.headSha, [summaryMarker(runId)])
+                ? { reviewId: r.id }
+                : undefined,
+          ),
       });
     } else {
       // The summary carries the true finding count even in sync mode, where
@@ -505,6 +529,7 @@ export class Publisher {
         finalReview,
         findings.length,
         sync ? [] : findings,
+        botLogin,
         signal,
       );
       reviewId = created.reviewId;
@@ -536,7 +561,7 @@ export class Publisher {
             commentIds.push(own.id);
             continue;
           }
-          commentIds.push(await this.postComment(subject, finding, runId, signal));
+          commentIds.push(await this.postComment(subject, finding, runId, botLogin, signal));
           continue;
         }
         const live = liveById.get(matchedId)!;
@@ -547,7 +572,7 @@ export class Publisher {
             await this.setThreadResolved(subject, thread.threadId, false, runId);
           }
           const body = this.ledgerHooks
-            ? bodyWithMarkers(finding.section, [
+            ? bodyWithAllMarkers(finding.section, [
                 ...extractMarkers(live.body),
                 findingMarker(runId, finding.label),
               ])
@@ -564,15 +589,16 @@ export class Publisher {
               response.status === 200
                 ? { ok: true, remote: { commentId: matchedId } }
                 : { ok: false, status: response.status, reason: `updating comment ${matchedId} failed with HTTP ${response.status}: ${describeBody(response.body)}` },
-            reconcile: async () => {
-              const read = await readAllReviewComments(this.api, subject.repository, subject.pullNumber);
-              if (!read.ok) return { status: "unknown" as const, detail: `listing review comments failed (HTTP ${read.status})` };
-              const found = read.items.find(
-                (c) => c.id === matchedId && extractMarkers(c.body).includes(findingMarker(runId, finding.label)),
-              );
-              if (found) return { status: "confirmed" as const, remote: { commentId: found.id } };
-              return { status: "not_found" as const };
-            },
+            reconcile: () =>
+              reconcileListing(
+                () => readAllReviewComments(this.api, subject.repository, subject.pullNumber),
+                "listing review comments",
+                (c) =>
+                  c.id === matchedId &&
+                  matchesPublished(c, botLogin, subject.headSha, [findingMarker(runId, finding.label)])
+                    ? { commentId: c.id }
+                    : undefined,
+              ),
           });
           commentIds.push(matchedId);
         } else {
@@ -592,15 +618,17 @@ export class Publisher {
               response.status === 200
                 ? { ok: true, remote: { commentId: matchedId } }
                 : { ok: false, status: response.status, reason: `marking comment ${matchedId} superseded failed with HTTP ${response.status}: ${describeBody(response.body)}` },
-            reconcile: async () => {
-              const read = await readAllReviewComments(this.api, subject.repository, subject.pullNumber);
-              if (!read.ok) return { status: "unknown" as const, detail: `listing review comments failed (HTTP ${read.status})` };
-              const found = read.items.find((c) => c.id === matchedId && isSupersededCommentText(c.body));
-              if (found) return { status: "confirmed" as const, remote: { commentId: found.id } };
-              return { status: "not_found" as const };
-            },
+            reconcile: () =>
+              reconcileListing(
+                () => readAllReviewComments(this.api, subject.repository, subject.pullNumber),
+                "listing review comments",
+                (c) =>
+                  c.id === matchedId && c.authorLogin === botLogin && isSupersededCommentText(c.body)
+                    ? { commentId: c.id }
+                    : undefined,
+              ),
           });
-          commentIds.push(await this.postComment(subject, finding, runId, signal));
+          commentIds.push(await this.postComment(subject, finding, runId, botLogin, signal));
         }
       }
     }
@@ -634,6 +662,7 @@ export class Publisher {
     finalReview: string,
     findingCount: number,
     inline: ReviewFinding[],
+    botLogin: string,
     signal?: AbortSignal,
   ): Promise<{ reviewId: number; commentIds: number[] }> {
     const body = this.ledgerHooks
@@ -676,21 +705,15 @@ export class Publisher {
           remote: { reviewId: created.id, commentIds: (created.comments ?? []).map((c) => c.id) },
         };
       },
-      reconcile: async () => {
-        const read = await readAllReviews(this.api, run.subject.repository, run.subject.pullNumber);
-        if (!read.ok) return { status: "unknown" as const, detail: `listing reviews failed (HTTP ${read.status})` };
-        const found = read.items.find(
-          (r) => extractMarkers(r.body).includes(summaryMarker(run.runId)) && r.commitId === run.subject.headSha,
-        );
-        if (found) {
-          const full = found as ReconcileReview & { comments?: Array<{ id: number }> };
-          return {
-            status: "confirmed" as const,
-            remote: { reviewId: found.id, commentIds: (full.comments ?? []).map((c) => c.id) },
-          };
-        }
-        return { status: "not_found" as const };
-      },
+      reconcile: () =>
+        reconcileListing(
+          () => readAllReviews(this.api, run.subject.repository, run.subject.pullNumber),
+          "listing reviews",
+          (r) =>
+            matchesPublished(r, botLogin, run.subject.headSha, [summaryMarker(run.runId)])
+              ? { reviewId: r.id, commentIds: r.commentIds ?? [] }
+              : undefined,
+        ),
     });
     return { reviewId: remote.reviewId!, commentIds: remote.commentIds ?? [] };
   }
@@ -701,6 +724,7 @@ export class Publisher {
     subject: RunDocument["subject"],
     finding: ReviewFinding,
     runId: string,
+    botLogin: string,
     signal?: AbortSignal,
   ): Promise<number> {
     // Ordinal marker: the first comment for this label in this run is plain;
@@ -744,15 +768,13 @@ export class Publisher {
         }
         return { ok: true, remote: { commentId: created.id } };
       },
-      reconcile: async () => {
-        const read = await readAllReviewComments(this.api, subject.repository, subject.pullNumber);
-        if (!read.ok) return { status: "unknown" as const, detail: `listing review comments failed (HTTP ${read.status})` };
-        const found = read.items.find(
-          (c) => extractMarkers(c.body).includes(marker) && c.commitId === subject.headSha,
-        );
-        if (found) return { status: "confirmed" as const, remote: { commentId: found.id } };
-        return { status: "not_found" as const };
-      },
+      reconcile: () =>
+        reconcileListing(
+          () => readAllReviewComments(this.api, subject.repository, subject.pullNumber),
+          "listing review comments",
+          (c) =>
+            matchesPublished(c, botLogin, subject.headSha, [marker]) ? { commentId: c.id } : undefined,
+        ),
     });
     return remote.commentId!;
   }

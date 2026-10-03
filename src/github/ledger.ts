@@ -74,6 +74,20 @@ export interface PublicationOp {
 type LedgerValueShape = { [key: string]: JsonLike } & { ops: PublicationOp[] };
 type JsonLike = null | boolean | number | string | JsonLike[] | { [key: string]: JsonLike };
 
+/** The intent bag every ledgered write carries: the operation key's fields
+ * (logical subject, run, intended change), the exact payload, the marker
+ * embedded in the payload's body and the attempt ordinal. */
+export interface RecordedIntent {
+  opKey: string;
+  runId: string;
+  intent: PublicationIntent;
+  subject: string;
+  reviewedSubject: PublicationOp["reviewedSubject"];
+  payload: unknown;
+  marker: string;
+  attempts: number;
+}
+
 /** Session-scoped ledger of publication operations (one review host). */
 export const PublicationLedgerDoc: SessionDocToken<LedgerValueShape> = defineDoc({
   kind: "nitpi.publication-ops",
@@ -160,22 +174,10 @@ export class PublicationLedger {
    * Commit the intent before the write: upsert with the payload (strict JSON)
    * and the attempt ordinal. Called once per write attempt under the key.
    */
-  async recordIntent(
-    intent: {
-      opKey: string;
-      runId: string;
-      intent: PublicationIntent;
-      subject: string;
-      reviewedSubject: PublicationOp["reviewedSubject"];
-      payload: unknown;
-      marker: string;
-      attempts: number;
-    },
-    context: Context,
-  ): Promise<void> {
+  async recordIntent(intent: RecordedIntent, context: Context): Promise<void> {
     if (!context) throw new Error("publication ledger requires an explicit context (no TODO_CONTEXT fallback)");
     await this.harness.commit(async (tx) => {
-      await upsertOp(tx, intent, context);
+      await upsertOp(tx, intent);
     }, context);
   }
 
@@ -212,20 +214,7 @@ export class PublicationLedger {
 
 /** Upsert inside a caller-provided transaction (used by `recordIntent` and
  * by tests that stage several intents in one commit). */
-export async function upsertOp(
-  tx: Tx,
-  intent: {
-    opKey: string;
-    runId: string;
-    intent: PublicationIntent;
-    subject: string;
-    reviewedSubject: PublicationOp["reviewedSubject"];
-    payload: unknown;
-    marker: string;
-    attempts: number;
-  },
-  context: Context,
-): Promise<void> {
+export async function upsertOp(tx: Tx, intent: RecordedIntent): Promise<void> {
   const doc = await tx.doc(PublicationLedgerDoc);
   const ops = [...doc.ops];
   const index = ops.findIndex((op) => op.opKey === intent.opKey);

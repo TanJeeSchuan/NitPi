@@ -18,6 +18,8 @@ export interface ReconcileReview {
   body: string;
   authorLogin: string;
   commitId: string;
+  /** Inline comment IDs the review was submitted with. */
+  commentIds?: number[];
 }
 
 /** A bot review comment as read from GitHub for reconciliation. */
@@ -26,6 +28,9 @@ export interface ReconcileComment {
   body: string;
   authorLogin: string;
   commitId: string;
+  path: string;
+  side: string;
+  line: number;
   inReplyToId?: number;
 }
 
@@ -50,14 +55,25 @@ export function payloadMarkers(op: PublicationOp): string[] {
  */
 export function recordMatchesRemote(
   op: PublicationOp,
-  remote: { bodyMarkers: string[]; commitId: string; authorLogin: string },
+  remote: { body: string; commitId: string; authorLogin: string },
   botLogin: string,
 ): boolean {
+  return matchesPublished(remote, botLogin, op.reviewedSubject.headSha, payloadMarkers(op));
+}
+
+/** The shared three-part match (ticket 05: marker, author, reviewed
+ * subject): the object was written by the reviewer bot on the reviewed head
+ * and carries one of the intended markers. */
+export function matchesPublished(
+  remote: { body: string; commitId: string; authorLogin: string },
+  botLogin: string,
+  reviewedHeadSha: string,
+  markers: readonly string[],
+): boolean {
   if (remote.authorLogin !== botLogin) return false;
-  if (op.reviewedSubject.headSha && remote.commitId && remote.commitId !== op.reviewedSubject.headSha) {
-    return false;
-  }
-  return payloadMarkers(op).some((m) => remote.bodyMarkers.includes(m));
+  if (reviewedHeadSha && remote.commitId && remote.commitId !== reviewedHeadSha) return false;
+  const bodyMarkers = extractMarkers(remote.body);
+  return markers.some((m) => bodyMarkers.includes(m));
 }
 
 /** The outcome of one paginated reconciliation read: `ok` lists are
@@ -67,86 +83,96 @@ export function recordMatchesRemote(
 export type PaginatedRead<T> = { ok: true; items: T[] } | { ok: false; status: number };
 
 /** Follow the listing's `Link` header (`rel="next"`, GitHub's pagination
- * contract) page by page; without one, a shorter-than-`per_page` page ends
- * the listing. */
-function hasNext(response: { status: number; headers?: Record<string, string> }): boolean {
-  const link = response.headers?.["link"] ?? "";
-  return /rel="next"/.test(link);
+ * contract) page by page; without one the listing is done. A non-200 page
+ * makes the whole read unestablishable. */
+async function readAllPages<T>(
+  fetchPage: (page: number) => Promise<HttpResponse>,
+  map: (raw: Record<string, unknown>) => T,
+  perPage = 100,
+): Promise<PaginatedRead<T>> {
+  const items: T[] = [];
+  for (let page = 1; ; page += 1) {
+    const response = await fetchPage(page);
+    if (response.status !== 200) return { ok: false, status: response.status };
+    for (const raw of response.body as Array<Record<string, unknown>>) items.push(map(raw));
+    if (!hasNextPage(response)) return { ok: true, items };
+  }
 }
 
-/** Read all of the pull request's review comments, any author, following
- * pagination (`page`/`per_page`) until the listing is exhausted. */
+/** The listing's `Link` header carries `rel="next"` while pages remain. */
+function hasNextPage(response: { headers?: Record<string, string> }): boolean {
+  return /rel="next"/.test(response.headers?.["link"] ?? "");
+}
+
+/** Read all of the pull request's review comments, any author. */
 export async function readAllReviewComments(
   api: GitHubApi,
   repository: string,
   pullNumber: number,
-  perPage = 100,
 ): Promise<PaginatedRead<ReconcileComment>> {
-  const items: ReconcileComment[] = [];
-  for (let page = 1; ; page += 1) {
-    const response: HttpResponse = await api.listReviewComments(repository, pullNumber, { page, perPage });
-    if (response.status !== 200) return { ok: false, status: response.status };
-    for (const raw of response.body as Array<Record<string, unknown>>) {
-      items.push({
-        id: raw.id as number,
-        body: (raw.body as string) ?? "",
-        authorLogin: (raw.user as { login?: string } | undefined)?.login ?? "",
-        commitId: (raw.commit_id as string) ?? "",
-        ...(raw.in_reply_to_id != null ? { inReplyToId: raw.in_reply_to_id as number } : {}),
-      });
-    }
-    if (!hasNext(response)) return { ok: true, items };
-  }
+  return readAllPages(
+    (page) => api.listReviewComments(repository, pullNumber, { page }),
+    (raw) => ({
+      id: raw.id as number,
+      body: (raw.body as string) ?? "",
+      authorLogin: (raw.user as { login?: string } | undefined)?.login ?? "",
+      commitId: (raw.commit_id as string) ?? "",
+      path: (raw.path as string) ?? "",
+      side: (raw.side as string) ?? "RIGHT",
+      line: (raw.line as number) ?? 0,
+      ...(raw.in_reply_to_id != null ? { inReplyToId: raw.in_reply_to_id as number } : {}),
+    }),
+  );
 }
 
-/** Read all of the pull request's reviews, any author, with markers,
- * following pagination. */
+/** Read all of the pull request's reviews, any author, with markers. */
 export async function readAllReviews(
   api: GitHubApi,
   repository: string,
   pullNumber: number,
-  perPage = 100,
 ): Promise<PaginatedRead<ReconcileReview>> {
-  const items: ReconcileReview[] = [];
-  for (let page = 1; ; page += 1) {
-    const response = await api.listReviews(repository, pullNumber, { page, perPage });
-    if (response.status !== 200) return { ok: false, status: response.status };
-    for (const raw of response.body as Array<Record<string, unknown>>) {
-      items.push({
-        id: raw.id as number,
-        body: (raw.body as string) ?? "",
-        authorLogin: (raw.user as { login?: string } | undefined)?.login ?? "",
-        commitId: (raw.commit_id as string) ?? "",
-      });
-    }
-    if (!hasNext(response)) return { ok: true, items };
-  }
+  return readAllPages(
+    (page) => api.listReviews(repository, pullNumber, { page }),
+    (raw) => ({
+      id: raw.id as number,
+      body: (raw.body as string) ?? "",
+      authorLogin: (raw.user as { login?: string } | undefined)?.login ?? "",
+      commitId: (raw.commit_id as string) ?? "",
+      ...((raw.comments as Array<{ id: number }> | undefined)
+        ? { commentIds: (raw.comments as Array<{ id: number }>).map((c) => c.id) }
+        : {}),
+    }),
+  );
 }
 
 /** One page of the paginated review-thread listing (GraphQL). */
 export interface ThreadPage {
-  nodes: Array<{
-    id: string;
-    isResolved: boolean;
-    comments: { nodes: Array<{ databaseId: number }> };
-  }>;
+  nodes: ReviewThreadNode[];
   hasNextPage: boolean;
   endCursor: string | null;
+}
+
+/** One review thread node as the GraphQL listing serves it. */
+export interface ReviewThreadNode {
+  id: string;
+  isResolved: boolean;
+  comments: { nodes: Array<{ databaseId: number }> };
 }
 
 /**
  * All review threads with pagination. The publisher uses this instead of the
  * first-page-only query it shipped with (ticket 04), so thread resolution
- * stays correct on long pull requests.
+ * stays correct on long pull requests. A failed page is signaled, not
+ * swallowed: reconciliation must treat an unreadable listing as unknown.
  */
 export async function readThreadPages(
   api: GitHubApi,
   repository: string,
   pullNumber: number,
   pageSize = 100,
-): Promise<ThreadPage["nodes"]> {
+): Promise<PaginatedRead<ReviewThreadNode>> {
   const [owner, name] = repository.split("/");
-  const nodes: ThreadPage["nodes"] = [];
+  const nodes: ReviewThreadNode[] = [];
   let cursor: string | undefined = undefined;
   for (;;) {
     const query = `query($owner: String!, $name: String!, $number: Int!${cursor ? ", $after: String" : ""}) {
@@ -167,14 +193,16 @@ export async function readThreadPages(
       query,
       cursor ? { owner, name, number: pullNumber, after: cursor } : { owner, name, number: pullNumber },
     );
-    if (response.status !== 200) return nodes;
+    if (response.status !== 200 || response.body.errors?.length) {
+      return { ok: false, status: response.status };
+    }
     const data = response.body.data as
       | {
           repository?: {
             pullRequest?: {
               reviewThreads?: {
                 pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
-                nodes?: ThreadPage["nodes"];
+                nodes?: ReviewThreadNode[];
               };
             };
           };
@@ -182,8 +210,7 @@ export async function readThreadPages(
       | undefined;
     const page = data?.repository?.pullRequest?.reviewThreads;
     for (const node of page?.nodes ?? []) nodes.push(node);
-    if (!page?.pageInfo?.hasNextPage || !page.pageInfo.endCursor) break;
+    if (!page?.pageInfo?.hasNextPage || !page.pageInfo.endCursor) return { ok: true, items: nodes };
     cursor = page.pageInfo.endCursor;
   }
-  return nodes;
 }
