@@ -51,13 +51,16 @@ import type { ReviewHostConfig } from "./config.js";
 import type { ResolvedInstructions } from "./instructions.js";
 import type { RunDocument, RunHistory, RunPhase, StageUsage } from "./run-history.js";
 
+/** The review commands the trigger gate accepts today (ticket 09 widens it
+ *  with `cancel`). */
+export type ReviewCommand = "/review" | "/review clean";
+
 export interface ReviewRunRequest {
   readonly repository: string;
   readonly pullNumber: number;
   readonly baseSha: string;
   readonly headSha: string;
-  /** `/review` or `/review clean` (`cancel` is ticket 09). */
-  readonly command: string;
+  readonly command: ReviewCommand;
 }
 
 /** Imported report entry (ticket 07): one clean run's completed review in the
@@ -113,21 +116,24 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
         // conversation; a clean run (ticket 07) opens a fresh task-owned
         // conversation instead — never a fork of the canonical one, and the
         // canonical conversation stays idle until the report is imported.
-        let primary = await harnessConversation(host.runHistory.harness, task.input.canonicalConversationId);
+        let primaryConversation = await harnessConversation(
+          host.runHistory.harness,
+          task.input.canonicalConversationId,
+        );
         if (runDoc.mode === "clean") {
           const fresh = await freshTaskOwnedConversation(runtime, context);
           await commitRunUpdate(host, task.input.runId, context, (run) => ({
             ...run,
             primaryConversationId: fresh.id as unknown as string,
           }));
-          primary = fresh;
+          primaryConversation = fresh;
         }
 
         // Primary instructions: protocol + policy + repository layers, with
         // the content hash recorded on the run document.
         const instructions = host.getInstructions("primary");
         await configureConversation(
-          primary,
+          primaryConversation,
           "nitpi-primary",
           host.config.primary.modelId,
           instructions.text,
@@ -146,10 +152,10 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
 
         // Primary turn: one prompt, run to completion, Pi keeps the tool loop.
         const prompt = buildPrimaryPrompt(runDoc);
-        await runConversationTurn(primary, prompt, context);
+        await runConversationTurn(primaryConversation, prompt, context);
 
         // Freeze the hand-off: stored unchanged as free-form text.
-        const answer = await latestAssistant(primary, context);
+        const answer = await latestAssistant(primaryConversation, context);
         const artifact = answer?.text ?? "";
         await commitRunUpdate(host, task.input.runId, context, (run) => ({
           ...run,
@@ -409,9 +415,11 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
       try {
         const host = reviewTaskDeps();
         const runDoc = await host.runHistory.findRun(task.input.runId, context);
+        // Invariant, not a duplicate decision: the routing in the match phase
+        // must never send a normal run here; the frozen-final-review and
+        // marker guards live inside the import transaction itself.
         if (!runDoc) throw new Error(`run ${task.input.runId} is not recorded`);
         if (runDoc.mode !== "clean") throw new Error("only clean runs import their report");
-        if (!runDoc.finalReview) throw new Error("final review is not frozen");
         await commitImportedReport(host.runHistory, task.input.runId, context);
 
         await runtime.commit(

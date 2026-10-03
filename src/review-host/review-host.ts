@@ -29,6 +29,7 @@ import { type GitHubApi } from "../github/publisher.js";
 import {
   installReviewTaskDeps,
   reviewTask,
+  type ReviewCommand,
   type ReviewRunRequest,
   type ReviewTaskDeps,
 } from "./review-task.js";
@@ -213,7 +214,7 @@ class ReviewHostImpl implements ReviewHost {
     }
 
     const runId = `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-    const request = toRunRequest(subject, parsed.commandText);
+    const request = toRunRequest(subject, parsed.command);
     const started = await this.harness.commit(async (tx) => {
       const taskId = await tx.createTask(
         reviewTask,
@@ -279,22 +280,22 @@ class ReviewHostImpl implements ReviewHost {
   }
 }
 
-function toRunRequest(subject: RunDocument["subject"], commandText: string): ReviewRunRequest {
+function toRunRequest(subject: RunDocument["subject"], command: ReviewCommand): ReviewRunRequest {
   return {
     repository: subject.repository,
     pullNumber: subject.pullNumber,
     baseSha: subject.baseSha,
     headSha: subject.headSha,
-    command: commandText as ReviewRunRequest["command"],
+    command,
   };
 }
 
 /** `/review` → mode normal; `/review clean` → mode clean (ticket 07). Any
  * other spelling is refused before any GitHub call. */
-function parseReviewCommand(text: string): { mode: "normal" | "clean"; commandText: string } | undefined {
+function parseReviewCommand(text: string): { mode: "normal" | "clean"; command: ReviewCommand } | undefined {
   const normalized = text.trim().replace(/\s+/g, " ").toLowerCase();
-  if (normalized === "/review") return { mode: "normal", commandText: "/review" };
-  if (normalized === "/review clean") return { mode: "clean", commandText: "/review clean" };
+  if (normalized === "/review") return { mode: "normal", command: "/review" };
+  if (normalized === "/review clean") return { mode: "clean", command: "/review clean" };
   return undefined;
 }
 
