@@ -15,6 +15,11 @@ export interface ScenarioStage {
   primaryStub: ModelStub;
   reReviewStub: ModelStub;
   host: ReviewHost;
+  /** Current re-review stub serve hook (ticket 07 tests snapshot other
+   * fixtures' state at the freeze moment, i.e. when a given request arrives). */
+  onReReviewServe: { current?: (index: number) => void };
+  /** Log index this test's latest onReReviewServe hook captured; -1 until set. */
+  freezeLogIndex: number;
 }
 
 /** The reviewed diff in the git fixture: handler.ts lines 3 and 5 on RIGHT. */
@@ -23,7 +28,11 @@ export const STAGE_ANCHORS = ["src/handler.ts#RIGHT#3", "src/handler.ts#RIGHT#5"
 /** One fake GitHub + two model stubs + one review host, all test-scoped. */
 export async function openScenarioStage(
   repo: GitRepoFixture,
-  opts: { primary: StubScript; reReview: StubScript; workspace: string },
+  opts: {
+    primary: StubScript;
+    reReview: StubScript;
+    workspace: string;
+  },
 ): Promise<ScenarioStage> {
   const fake = new FakeGitHub(
     [{ number: 7, headSha: repo.headSha, baseSha: repo.baseSha, state: "open" }],
@@ -34,7 +43,8 @@ export async function openScenarioStage(
   );
   const githubBase = await fake.listen();
   const primaryStub = new ModelStub(opts.primary, "stub-primary");
-  const reReviewStub = new ModelStub(opts.reReview, "stub-rereview");
+  const onReReviewServe: { current?: (index: number) => void } = {};
+  const reReviewStub = new ModelStub(opts.reReview, "stub-rereview", (index) => onReReviewServe.current?.(index));
   const [primaryBase, reReviewBase] = await Promise.all([primaryStub.listen(), reReviewStub.listen()]);
   const host = await openHostOnStorage(
     {
@@ -58,7 +68,7 @@ export async function openScenarioStage(
     },
     join(opts.workspace, `run-${Math.random().toString(36).slice(2)}`),
   );
-  return { fake, primaryStub, reReviewStub, host };
+  return { fake, primaryStub, reReviewStub, host, onReReviewServe, freezeLogIndex: -1 };
 }
 
 /** Close everything; a closed host must not mask earlier test failures. */
@@ -68,13 +78,19 @@ export async function closeScenarioStage(stage: ScenarioStage): Promise<void> {
   await stage.fake.close();
 }
 
-/** A writer's `/review` on the stage's pull request, run to completion. */
-export async function runReview(stage: ScenarioStage): Promise<{ runId: string }> {
+/** A writer's `/review` (or `/review clean`) on the stage's pull request,
+ * run to completion. */
+export async function runReview(
+  stage: ScenarioStage,
+  command: "/review" | "/review clean" = "/review",
+): Promise<{ runId: string }> {
   const started = await stage.host.handleReviewCommand({
     repository: "example/widgets",
     pullNumber: 7,
     requester: "octocat",
+    command,
   });
+  if (started.refused) throw new Error(started.refused);
   await stage.host.waitForRun(started.runId);
   return { runId: started.runId };
 }

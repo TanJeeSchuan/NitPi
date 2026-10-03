@@ -62,6 +62,7 @@ import { type GitHubApi } from "../github/publisher.js";
 import {
   installReviewTaskDeps,
   reviewTask,
+  type ReviewCommand,
   type ReviewRunRequest,
   type ReviewTaskDeps,
 } from "./review-task.js";
@@ -73,8 +74,8 @@ export interface ReviewHost {
   /**
    * Trigger gate entry: all issue-comment commands (`/review`, `/review
    * clean`, `/review cancel`). The gate applies the same requester check to
-   * each; `/review` starts one run for the current head, the other commands
-   * are recognised but wired by tickets 07/09. Refusals return a reason. A
+   * each; `/review` starts one normal run for the current head, `/review
+   * clean` one clean run (ticket 07); `/review cancel` is wired by ticket 09. Refusals return a reason. A
    * failed attempt for the same head is resumed rather than restarted
    * (ticket 06).
    */
@@ -557,13 +558,16 @@ class ReviewHostImpl implements ReviewHost {
       const taskId = await tx.createTask(
         reviewTask,
         { runId, canonicalConversationId: canonicalId!, request: runRequest },
+        // Task ownership sits on the canonical conversation in both modes:
+        // it is host machinery. A clean run's REVIEWER conversations are the
+        // fresh task-owned ones created inside the pipeline (review-task).
         { ownership: { kind: "conversation" }, conversationId: canonicalId as never },
       );
       const run: RunDocument = {
         kind: "nitpi.run",
         version: 1,
         runId,
-        mode: "normal",
+        mode: request.command === "/review clean" ? "clean" : "normal",
         source: request.source,
         phase: "primary",
         subject: {
@@ -596,10 +600,14 @@ class ReviewHostImpl implements ReviewHost {
     runDoc: RunDocument,
   ): Promise<{ runId: string; refused?: string; conversationId: string }> {
     const context = TODO_CONTEXT;
-    const initialPhase: "primary" | "re-review" | "match" | "publish" = runDoc.finalReview
-      ? runDoc.matches !== undefined
-        ? "publish"
-        : "match"
+    // A clean run imports its report (ticket 07) between matching and
+    // publication; the import marker records that it already happened.
+    const initialPhase: "primary" | "re-review" | "match" | "import" | "publish" = runDoc.finalReview
+      ? runDoc.matches === undefined
+        ? "match"
+        : runDoc.mode === "clean" && !runDoc.imported
+          ? "import"
+          : "publish"
       : runDoc.artifactFrozen && runDoc.artifact
         ? "re-review"
         : "primary";
@@ -756,14 +764,16 @@ function toRunRequest(runDoc: RunDocument): ReviewRunRequest {
     pullNumber: runDoc.subject.pullNumber,
     baseSha: runDoc.subject.baseSha,
     headSha: runDoc.subject.headSha,
-    command: "/review",
+    command: runDoc.mode === "clean" ? "/review clean" : "/review",
     source: runDoc.source ?? "command",
     triggeredBy: runDoc.triggeredBy ?? "/review (resumed)",
   };
 }
 
-function phaseForResume(initialPhase: "primary" | "re-review" | "match" | "publish"): RunDocument["phase"] {
+function phaseForResume(initialPhase: "primary" | "re-review" | "match" | "import" | "publish"): RunDocument["phase"] {
   switch (initialPhase) {
+    case "import":
+      return "matched";
     case "publish":
       return "publishing";
     case "match":

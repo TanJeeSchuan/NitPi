@@ -25,6 +25,7 @@ import { defineDoc, type Harness, type Tx } from "@earendil-works/pi-durable";
 import type { GitHubApi } from "../github/publisher.js";
 import type { AutoModeConfig } from "./config.js";
 import type { RunDocument, RunHistory } from "./run-history.js";
+import type { ReviewCommand } from "./review-task.js";
 
 /** Pull-request event the automatic mode can subscribe to. */
 export type PrAction = "opened" | "reopened" | "synchronize" | "ready_for_review";
@@ -95,8 +96,8 @@ export interface GateStart {
   headSha: string;
   /** Source of the request, recorded on the run document. */
   source: "command" | "automatic";
-  /** For command sources: the recorded `/review`. */
-  command: "/review";
+  /** For command sources: the recorded `/review` or `/review clean`. */
+  command: ReviewCommand;
   /** Who asked (login) when the request came from a command. */
   requester?: string;
   /** Original trigger, for the run document and check summary. */
@@ -119,7 +120,7 @@ export interface ForkApprovalRecord {
  */
 export interface PendingRequestDoc {
   source: "command" | "automatic";
-  command?: "/review";
+  command?: ReviewCommand;
   action?: PrAction;
   requester?: string;
   headSha?: string;
@@ -349,21 +350,26 @@ export class TriggerGate {
         if (active.subject.headSha === headSha) return { outcome: "satisfied", run: active };
         return this.queueCommand(event, deliveryKey, headSha, isFork(body));
       }
-      // /review clean and /review cancel behave later (tickets 07/09); the
-      // gate recognises them but their run wiring is not built yet.
+      // /review clean (ticket 07) is a deliberate new run: it queues behind
+      // the active run, whatever head that run reviews.
+      if (event.command === "/review clean") {
+        return this.queueCommand(event, deliveryKey, headSha, isFork(body));
+      }
+      // /review cancel behaves later (ticket 09); the gate recognises it but
+      // its run wiring is not built yet.
       return {
         outcome: "refused",
-        reason: `${event.command} is not wired yet (ticket ${event.command === "/review clean" ? "07" : "09"})`,
+        reason: `${event.command} is not wired yet (ticket 09)`,
         checkOutcome: "action_required",
         headSha,
         baseSha,
       };
     }
 
-    if (event.command !== "/review") {
+    if (event.command === "/review cancel") {
       return {
         outcome: "refused",
-        reason: `${event.command} is not wired yet (ticket ${event.command === "/review clean" ? "07" : "09"})`,
+        reason: `${event.command} is not wired yet (ticket 09)`,
         checkOutcome: "action_required",
         headSha,
         baseSha,
@@ -385,7 +391,7 @@ export class TriggerGate {
         pullNumber: event.pullNumber,
         baseSha,
         headSha,
-        command: "/review",
+        command: event.command,
         requester: event.requester,
         triggeredBy: `${event.requester} commented "${event.command}"`,
       },
@@ -409,7 +415,7 @@ export class TriggerGate {
       }
       storePending(gate, event.repository, event.pullNumber, {
         source: "command",
-        command: "/review",
+        command: event.command === "/review clean" ? "/review clean" : "/review",
         requester: event.requester,
         headSha,
         deliveryKey,

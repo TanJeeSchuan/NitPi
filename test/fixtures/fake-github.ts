@@ -103,6 +103,10 @@ export class FakeGitHub {
   readonly state: FakeGitHubState;
   /** Login → permission level; default writer. Tests override per login. */
   collaboratorPermissions: Record<string, "read" | "write" | "admin"> = {};
+  /** Every request routed through this fake, in order (ticket 07 tests this
+   * log to show what was read when — e.g. no comment listings before a
+   * clean run's freeze). */
+  readonly requestLog: Array<{ method: string; path: string; accept: string }> = [];
   private server: Server | undefined;
   private reviewsSeq = 100;
   private commentsSeq = 1000;
@@ -176,6 +180,7 @@ export class FakeGitHub {
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const url = new URL(request.url ?? "/", "http://fake-github.test");
     const path = url.pathname.replace(/^\/api\/v3/, "");
+    this.requestLog.push({ method: request.method ?? "", path, accept: String(request.headers.accept ?? "") });
     if (request.method === "POST" && this.state.dropNextWrite.remaining > 0 && new RegExp(this.state.dropNextWrite.match).test(path)) {
       this.state.dropNextWrite.remaining -= 1;
       // Apply the write, then swallow the response (unknown outcome).
