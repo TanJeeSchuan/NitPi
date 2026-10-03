@@ -60,10 +60,12 @@ import type { Context } from "@earendil-works/chord";
 import { TODO_CONTEXT } from "@earendil-works/chord/context";
 import { createHash } from "node:crypto";
 import type { UserMessage } from "@earendil-works/pi-ai";
-import type { Conversation, Harness, Submission, TaskRuntime } from "@earendil-works/pi-durable";
+import type { Conversation, Harness, Submission, TaskId, TaskRuntime } from "@earendil-works/pi-durable";
 import { defineEntry, defineTask } from "@earendil-works/pi-durable";
 import { Publisher, PublishError } from "../github/publisher.js";
 import type { GitHubApi } from "../github/publisher.js";
+import { publicationTask } from "../github/publication-task.js";
+import type { PublishTaskResult } from "../github/publication-task.js";
 import { parseFinalReview, stripAuditNotes } from "./artifact.js";
 import {
   parseUnifiedDiffAnchors,
@@ -116,6 +118,10 @@ export interface ReviewTaskDeps {
   readonly api: GitHubApi;
   /** Duration in milliseconds after which a stage fails as incomplete. */
   stageDeadline(stage: "primary" | "re-review"): number;
+  /** Pacing for publication's rate-limit waits (ticket 05). Production uses
+   * the durable runtime clock; tests inject a recording clock so nothing
+   * ever really sleeps in the suite. */
+  publicationSleep?: (ms: number) => Promise<void>;
 }
 
 let deps: ReviewTaskDeps | undefined;
@@ -425,40 +431,79 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
       const subject = runDoc.subject;
 
       try {
+        // Idempotent re-entry: a crash between the publication commit and the
+        // task's terminal completion re-enters here with publication already
+        // recorded — nothing is written again.
+        if (runDoc.publication && runDoc.publicationOutcome === "published") {
+          await publisher.checkSuccess(subject, runDoc.findings?.length ?? 0);
+          await runtime.commit(
+            (_tx) =>
+              ({
+                status: "terminal" as const,
+                outcome: {
+                  status: "completed" as const,
+                  result: { published: true, reviewId: runDoc.publication!.reviewId },
+                },
+              }) as const,
+            context,
+          );
+          return;
+        }
+
         await publisher.checkInProgress(subject, "publish");
-        const published = await publisher.publish(
-          runDoc,
-          runDoc.finalReview,
-          runDoc.findings ?? [],
-          runDoc.earlierComments ?? [],
-          runDoc.matches ?? [],
-          context.abortSignal,
-        );
-        await commitRunUpdate(host, task.input.runId, context, (run) => ({
-          ...run,
-          publication: { reviewId: published.reviewId, commentIds: published.commentIds },
-          matchRejections: published.rejections,
-          phase: "published",
-          checkStatus: "success",
-          checkDetail: `published review ${published.reviewId} with ${run.findings?.length ?? 0} finding(s)`,
-        }));
-        await publisher.checkSuccess(subject, runDoc.findings?.length ?? 0);
+        // Publication runs as a durable child task (ticket 05): its own
+        // checkpoints, operation ledger and reconciliation survive a runner
+        // crash, and a failed publication retries as publication only — the
+        // completed final review is kept, with zero new model calls.
+        let childTaskId: TaskId<PublishTaskResult> | undefined;
         await runtime.commit(
-          (_tx) =>
-            ({
-              status: "terminal" as const,
-              outcome: {
-                status: "completed" as const,
-                result: { published: true, reviewId: published.reviewId },
-              },
-            }) as const,
+          async (tx) => {
+            childTaskId = await tx.createTask(
+              publicationTask,
+              { runId: task.input.runId },
+              { ownership: { kind: "task" as const, taskId: runtime.taskId } },
+            );
+            return undefined; // The child's creation is the commit; the phase continues unchanged.
+          },
+          context,
+        );
+        if (!childTaskId) throw new Error("publication child task was not created");
+        const settled = await runtime.waitForTask(childTaskId, context);
+        const outcome = settled.state.outcome as TaskOutcomeLike;
+        const settledOutcome = outcome.status === "completed" ? (outcome.result as { status: string; reviewId?: number } | undefined) : undefined;
+        if (outcome.status === "completed" && settledOutcome?.status === "published" && typeof settledOutcome.reviewId === "number") {
+          // The child committed the run document's publication, phase and
+          // check status; the pipeline closes out here.
+          const reviewId = settledOutcome.reviewId;
+          await runtime.commit(
+            (_tx) =>
+              ({
+                status: "terminal" as const,
+                outcome: {
+                  status: "completed" as const,
+                  result: { published: true, reviewId },
+                },
+              }) as const,
+            context,
+          );
+          return;
+        }
+        // Known failure or unknown outcome: the child already recorded the
+        // run document state and the GitHub check; the durable attempt fails
+        // with the child's reason and a later trigger resumes publication
+        // only.
+        const reason =
+          outcome.status === "failed"
+            ? outcome.error?.message ?? "publication failed"
+            : outcome.status === "aborted"
+              ? outcome.reason ?? "publication canceled"
+              : outcome.error?.message ?? "publication failed";
+        await runtime.commit(
+          (_tx) => ({ status: "terminal" as const, outcome: { status: "failed" as const, error: { message: reason } } }) as const,
           context,
         );
       } catch (error) {
         if (isKilledInvocation(runtime)) return; // A dead runner records nothing.
-        // Record the failure on the run document and GitHub. Storage being
-        // down must not itself turn into a crash here: the run doc update is
-        // best-effort, and the check still reports a reason.
         await failRun(task.input, context, error);
       }
     },
@@ -902,5 +947,14 @@ export const __testing = {
   buildAnchorFeedbackPrompt,
   StageTimeout,
 };
+
+/** Minimal structural view of a settled child task's outcome, narrowed in
+ * the publish phase (pi-durable's TaskOutcome union). */
+interface TaskOutcomeLike {
+  readonly status: "completed" | "failed" | "aborted" | "orphaned" | "faulted";
+  readonly result?: unknown;
+  readonly error?: { message: string };
+  readonly reason?: string;
+}
 
 export type { RunPhase };

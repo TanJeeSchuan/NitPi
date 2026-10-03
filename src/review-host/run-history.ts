@@ -101,6 +101,12 @@ export interface RunDocument {
   pinnedDiff?: string;
   reReviewConversationId?: string;
   publication?: { reviewId: number; commentIds: number[] };
+  /** Publication outcome (ticket 05): `published` on confirmed writes,
+   * `failed` on a known publication failure (the completed final review stays
+   * and a retry publishes with no new model calls), `unknown` when a write's
+   * outcome could not be established — the check is then not success and
+   * reconciliation is retried later instead of creating again. */
+  publicationOutcome?: "published" | "failed" | "unknown";
   /** Review-comment snapshot (any author) read at matching time — the input
    * the matching turn saw and the set the publisher validates against. */
   earlierComments?: PublishedComment[];

@@ -64,8 +64,8 @@ export class RestGitHubApi implements GitHubApi {
     );
   }
 
-  listReviews(repository: string, pullNumber: number) {
-    return this.request<unknown>("GET", `/repos/${repository}/pulls/${pullNumber}/reviews`);
+  listReviews(repository: string, pullNumber: number, query?: { page?: number; perPage?: number }) {
+    return this.request<unknown>("GET", this.listPath(`/repos/${repository}/pulls/${pullNumber}/reviews`, query));
   }
 
   createReviewComment(repository: string, pullNumber: number, payload: unknown, signal?: AbortSignal) {
@@ -77,8 +77,8 @@ export class RestGitHubApi implements GitHubApi {
     );
   }
 
-  listReviewComments(repository: string, pullNumber: number) {
-    return this.request<unknown>("GET", `/repos/${repository}/pulls/${pullNumber}/comments`);
+  listReviewComments(repository: string, pullNumber: number, query?: { page?: number; perPage?: number }) {
+    return this.request<unknown>("GET", this.listPath(`/repos/${repository}/pulls/${pullNumber}/comments`, query));
   }
 
   updateReviewComment(repository: string, commentId: number, payload: unknown, signal?: AbortSignal) {
@@ -88,6 +88,16 @@ export class RestGitHubApi implements GitHubApi {
       payload,
       signal,
     );
+  }
+
+  /** Append pagination query params (`page`, `per_page`) when given. */
+  private listPath(path: string, query?: { page?: number; perPage?: number }): string {
+    if (!query?.page && !query?.perPage) return path;
+    const params = new URLSearchParams();
+    if (query.page !== undefined) params.set("page", String(query.page));
+    if (query.perPage !== undefined) params.set("per_page", String(query.perPage));
+    const suffix = params.toString();
+    return suffix ? `${path}?${suffix}` : path;
   }
 
   createCheckRun(repository: string, payload: unknown) {

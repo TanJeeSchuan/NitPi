@@ -19,6 +19,7 @@ import {
   latestRun,
   openScenarioStage,
   runReview,
+  withoutPublishMarkers,
   type ScenarioStage,
 } from "../helpers/scenario-stage.js";
 import { createGitRepoFixture, type GitRepoFixture } from "../fixtures/git-fixture.js";
@@ -195,7 +196,7 @@ describe("scenario: reruns maintain findings across review threads (ticket 04)",
       expect(comments).toHaveLength(2);
       expect(comments[0]!.id).toBe(c1);
       // The original thread now carries the reworded finding.
-      expect(comments[0]!.body).toBe(rewordedF1);
+      expect(withoutPublishMarkers(comments[0]!.body)).toBe(rewordedF1);
       expect(comments[0]!.line).toBe(3);
 
       const run2 = await latestRun(stage);
@@ -235,7 +236,7 @@ describe("scenario: reruns maintain findings across review threads (ticket 04)",
       expect(stage.fake.threadForComment(c1)!.resolved).toBe(false);
       const comments = stage.fake.prComments(7);
       expect(comments.map((c) => c.id)).toEqual([c1, c2, humanReply.id]);
-      expect(comments[0]!.body).toBe(RUN1_F1_SECTION);
+      expect(withoutPublishMarkers(comments[0]!.body)).toBe(RUN1_F1_SECTION);
       // The person's reply is untouched even though it shares the thread.
       expect(comments[2]!.body).toBe("Filed upstream — see #1201.");
       expect(comments[2]!.author).toBe("helper-human");
@@ -286,7 +287,7 @@ describe("scenario: reruns maintain findings across review threads (ticket 04)",
       // The replacement sits at the new anchor with the current section text.
       const replacement = comments.find((c) => c.id !== c1 && c.id !== c2)!;
       expect(replacement.line).toBe(5);
-      expect(replacement.body).toBe(movedF1);
+      expect(withoutPublishMarkers(replacement.body)).toBe(movedF1);
       // F2 still updates its own thread in the same run.
       expect(comments.find((c) => c.id === c2)!.body).toContain("(Rechecked on rerun.)");
 
@@ -325,8 +326,8 @@ describe("scenario: reruns maintain findings across review threads (ticket 04)",
       expect(stage.fake.threadForComment(c1)!.resolved).toBe(false);
       const comments = stage.fake.prComments(7);
       expect(comments).toHaveLength(2);
-      expect(comments.find((c) => c.id === c2)!.body).toBe(RUN1_F2_SECTION);
-      expect(comments.find((c) => c.id === c1)!.body).toBe(partialF1);
+      expect(withoutPublishMarkers(comments.find((c) => c.id === c2)!.body)).toBe(RUN1_F2_SECTION);
+      expect(withoutPublishMarkers(comments.find((c) => c.id === c1)!.body)).toBe(partialF1);
 
       // Summary shows the current finding count.
       const review = stage.fake.publishedReviews(7)[0]!;
@@ -389,9 +390,9 @@ describe("scenario: reruns maintain findings across review threads (ticket 04)",
       expect(comments).toHaveLength(6);
       const posted = comments.slice(-2);
       expect(posted[0]!.line).toBe(3);
-      expect(posted[0]!.body).toBe(RUN1_F1_SECTION);
+      expect(withoutPublishMarkers(posted[0]!.body)).toBe(RUN1_F1_SECTION);
       expect(posted[1]!.line).toBe(5);
-      expect(posted[1]!.body).toBe(RUN1_F2_SECTION);
+      expect(withoutPublishMarkers(posted[1]!.body)).toBe(RUN1_F2_SECTION);
       expect(stage.fake.threadForComment(c1)!.resolved).toBe(true);
       expect(stage.fake.threadForComment(c2)!.resolved).toBe(true);
 
@@ -452,7 +453,7 @@ describe("scenario: reruns maintain findings across review threads (ticket 04)",
       expect(comments.find((c) => c.id === c1)!.body).toContain("**Superseded:**");
       // The run-2 replacement is untouched; run 3 posted a new comment at
       // the current anchor alongside it.
-      expect(comments.find((c) => c.id === replacement)!.body).toBe(movedF1);
+      expect(withoutPublishMarkers(comments.find((c) => c.id === replacement)!.body)).toBe(movedF1);
       expect(comments.filter((c) => c.line === 5)).toHaveLength(3);
       expect(comments).toHaveLength(4);
 
@@ -497,8 +498,8 @@ describe("scenario: reruns maintain findings across review threads (ticket 04)",
       // Both earlier threads were updated in place — no duplicates.
       const comments = stage.fake.prComments(7);
       expect(comments.map((c) => c.id)).toEqual([seeded1.id, seeded2.id]);
-      expect(comments[0]!.body).toBe(RUN1_F1_SECTION);
-      expect(comments[1]!.body).toBe(RUN1_F2_SECTION);
+      expect(withoutPublishMarkers(comments[0]!.body)).toBe(RUN1_F1_SECTION);
+      expect(withoutPublishMarkers(comments[1]!.body)).toBe(RUN1_F2_SECTION);
       // A summary review was created (body only) — one bot review total.
       const reviews = stage.fake.publishedReviews(7);
       expect(reviews).toHaveLength(1);

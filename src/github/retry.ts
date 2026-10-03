@@ -17,9 +17,14 @@ export const RATE_LIMIT_MIN_WAIT_MS = 60_000;
 /** Cap on the exponential growth so a bounded loop stays bounded. */
 const RATE_LIMIT_MAX_WAIT_MS = 32 * RATE_LIMIT_MIN_WAIT_MS;
 
-/** Classify one GitHub response for the retry client. */
-export function isRateLimited(status: number): boolean {
-  return status === 403 || status === 429;
+/** Classify one GitHub response for the retry client: 429 is always a rate
+ * limit; a 403 is one only when GitHub signals it (`Retry-After` present, or
+ * the core-limit counter exhausted) — otherwise it is a permission failure
+ * and is never retried. */
+export function isRateLimited(status: number, headers?: Record<string, string>): boolean {
+  if (status === 429) return true;
+  if (status !== 403) return false;
+  return headers?.["retry-after"] !== undefined || headers?.["x-ratelimit-remaining"] === "0";
 }
 
 /** Parse `Retry-After` (seconds, integer, per RFC 7231) from a response's stored headers. */
@@ -41,7 +46,7 @@ export function rateLimitDelayMs(
   rateLimitStreak: number,
   storedHeaders: Record<string, string> | undefined | null,
 ): number {
-  if (!isRateLimited(status)) return 0;
+  if (!isRateLimited(status, storedHeaders ?? undefined)) return 0;
   const retryAfter = retryAfterMs(storedHeaders);
   if (retryAfter !== undefined) return retryAfter;
   return Math.min(

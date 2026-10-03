@@ -80,6 +80,13 @@ export interface FakeGitHubState {
   checks: Array<{ headSha: string; state: string; detail: string; summary: string }>;
   /** Scripted responses: applied-write, then dropped (unknown outcome). */
   dropNextWrite: { match: RegExp; remaining: number };
+  /** Scripted refusals: the write is NOT applied; the response carries the
+   * status (and a `Retry-After` header when set) — ticket 05's rate-limit
+   * and permission scenarios. */
+  refuseNextWrite: { match: RegExp; remaining: number; status: number; retryAfter?: number; message?: string };
+  /** When set, list endpoints never serve more items per page than this,
+   * regardless of the requested `per_page` — the pagination exercise. */
+  enforceListPageSize?: number;
   /** 422 detail for malformed anchors. */
   validationErrors: Map<string, string>;
   /**
@@ -126,6 +133,7 @@ export class FakeGitHub {
       threads: [],
       checks: [],
       dropNextWrite: { match: /reviews$/, remaining: 0 },
+      refuseNextWrite: { match: /^$/, remaining: 0, status: 403 },
       validationErrors: new Map(),
       externalChecks: new Map(),
     };
@@ -171,10 +179,22 @@ export class FakeGitHub {
     return body;
   }
 
-  private respond(response: ServerResponse, status: number, body: unknown): void {
+  private respond(response: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
     response.statusCode = status;
     response.setHeader("content-type", "application/json");
+    for (const [name, value] of Object.entries(headers)) response.setHeader(name, value);
     response.end(JSON.stringify(body));
+  }
+
+  /** A scripted refusal fires before routing: the write is not applied and
+   * the response carries its status (plus `Retry-After` when scripted). */
+  private scriptedRefusal(request: IncomingMessage, path: string): boolean {
+    const scripted = this.state.refuseNextWrite;
+    if (scripted.remaining <= 0) return false;
+    if (!["POST", "PATCH", "PUT"].includes(request.method ?? "")) return false;
+    if (!new RegExp(scripted.match).test(path)) return false;
+    scripted.remaining -= 1;
+    return true;
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -191,7 +211,17 @@ export class FakeGitHub {
     const body = ["POST", "PATCH", "PUT"].includes(request.method ?? "") ? await this.readBody(request) : "";
     const accept = String(request.headers.accept ?? "");
     try {
-      this.route(request.method ?? "GET", path, body, response, accept);
+      if (this.scriptedRefusal(request, path)) {
+        const scripted = this.state.refuseNextWrite;
+        this.respond(
+          response,
+          scripted.status,
+          { message: scripted.message ?? "Request refused by scenario script" },
+          scripted.retryAfter !== undefined ? { "retry-after": String(scripted.retryAfter) } : {},
+        );
+        return;
+      }
+      this.route(request.method ?? "GET", path, body, response, accept, url.searchParams);
     } catch (error) {
       this.respond(response, 500, { message: String(error) });
     }
@@ -206,7 +236,7 @@ export class FakeGitHub {
     }
   }
 
-  private route(method: string, path: string, body: string, response: ServerResponse, accept = ""): void {
+  private route(method: string, path: string, body: string, response: ServerResponse, accept = "", params = new URLSearchParams()): void {
     if (method === "POST" && (path === "/api/graphql" || path === "/graphql")) {
       this.handleGraphql(body, response);
       return;
@@ -242,7 +272,10 @@ export class FakeGitHub {
       this.respond(
         response,
         200,
-        this.state.reviews.filter((r) => r.pullNumber === Number(prMatch[1])).map((r) => this.toRestReview(r)),
+        this.listPage(
+          this.state.reviews.filter((r) => r.pullNumber === Number(prMatch[1])).map((r) => this.toRestReview(r)),
+          params,
+        ),
       );
       return;
     }
@@ -299,7 +332,10 @@ export class FakeGitHub {
       this.respond(
         response,
         200,
-        this.state.comments.filter((c) => c.pullNumber === pullNumber).map((c) => this.toRestComment(c)),
+        this.listPage(
+          this.state.comments.filter((c) => c.pullNumber === pullNumber).map((c) => this.toRestComment(c)),
+          params,
+        ),
       );
       return;
     }
@@ -389,6 +425,17 @@ export class FakeGitHub {
     }
 
     this.respond(response, 404, { message: `unrouted: ${method} ${path}` });
+  }
+
+  /** Honor `page`/`per_page` like the REST list endpoints; a forced page
+   * size (the pagination exercise) caps every page. */
+  private listPage<T>(items: T[], params: URLSearchParams): T[] {
+    const requested = Number.parseInt(params.get("per_page") ?? "", 10);
+    const perPage =
+      this.state.enforceListPageSize ??
+      (Number.isInteger(requested) && requested > 0 ? requested : items.length + 1);
+    const page = Math.max(1, Number.parseInt(params.get("page") ?? "1", 10) || 1);
+    return items.slice((page - 1) * perPage, page * perPage);
   }
 
   /** Range-aware anchor check (ticket 02): the end anchor must be in the

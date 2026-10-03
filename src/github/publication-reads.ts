@@ -60,37 +60,59 @@ export function recordMatchesRemote(
   return payloadMarkers(op).some((m) => remote.bodyMarkers.includes(m));
 }
 
-/** Read all of the pull request's review comments, any author. */
+/** The outcome of one paginated reconciliation read: `ok` lists are
+ * authoritative (every page was read); a failed page makes the whole read
+ * unestablishable — the caller stays unknown instead of trusting a partial
+ * list. */
+export type PaginatedRead<T> = { ok: true; items: T[] } | { ok: false; status: number };
+
+/** Read all of the pull request's review comments, any author, following
+ * pagination (`page`/`per_page`) until the listing is exhausted. */
 export async function readAllReviewComments(
   api: GitHubApi,
   repository: string,
   pullNumber: number,
-): Promise<ReconcileComment[]> {
-  const response: HttpResponse = await api.listReviewComments(repository, pullNumber);
-  if (response.status !== 200) return [];
-  return (response.body as Array<Record<string, unknown>>).map((raw) => ({
-    id: raw.id as number,
-    body: (raw.body as string) ?? "",
-    authorLogin: (raw.user as { login?: string } | undefined)?.login ?? "",
-    commitId: (raw.commit_id as string) ?? "",
-    ...(raw.in_reply_to_id != null ? { inReplyToId: raw.in_reply_to_id as number } : {}),
-  }));
+  perPage = 100,
+): Promise<PaginatedRead<ReconcileComment>> {
+  const items: ReconcileComment[] = [];
+  for (let page = 1; ; page += 1) {
+    const response: HttpResponse = await api.listReviewComments(repository, pullNumber, { page, perPage });
+    if (response.status !== 200) return { ok: false, status: response.status };
+    for (const raw of response.body as Array<Record<string, unknown>>) {
+      items.push({
+        id: raw.id as number,
+        body: (raw.body as string) ?? "",
+        authorLogin: (raw.user as { login?: string } | undefined)?.login ?? "",
+        commitId: (raw.commit_id as string) ?? "",
+        ...(raw.in_reply_to_id != null ? { inReplyToId: raw.in_reply_to_id as number } : {}),
+      });
+    }
+    if ((response.body as Array<unknown>).length < perPage) return { ok: true, items };
+  }
 }
 
-/** Read all of the pull request's reviews, any author, with markers. */
+/** Read all of the pull request's reviews, any author, with markers,
+ * following pagination. */
 export async function readAllReviews(
   api: GitHubApi,
   repository: string,
   pullNumber: number,
-): Promise<ReconcileReview[]> {
-  const response = await api.listReviews(repository, pullNumber);
-  if (response.status !== 200) return [];
-  return (response.body as Array<Record<string, unknown>>).map((raw) => ({
-    id: raw.id as number,
-    body: (raw.body as string) ?? "",
-    authorLogin: (raw.user as { login?: string } | undefined)?.login ?? "",
-    commitId: (raw.commit_id as string) ?? "",
-  }));
+  perPage = 100,
+): Promise<PaginatedRead<ReconcileReview>> {
+  const items: ReconcileReview[] = [];
+  for (let page = 1; ; page += 1) {
+    const response = await api.listReviews(repository, pullNumber, { page, perPage });
+    if (response.status !== 200) return { ok: false, status: response.status };
+    for (const raw of response.body as Array<Record<string, unknown>>) {
+      items.push({
+        id: raw.id as number,
+        body: (raw.body as string) ?? "",
+        authorLogin: (raw.user as { login?: string } | undefined)?.login ?? "",
+        commitId: (raw.commit_id as string) ?? "",
+      });
+    }
+    if ((response.body as Array<unknown>).length < perPage) return { ok: true, items };
+  }
 }
 
 /** One page of the paginated review-thread listing (GraphQL). */

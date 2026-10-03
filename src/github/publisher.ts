@@ -146,8 +146,9 @@ export interface GitHubApi {
     reviewId: number,
     payload: { body: string },
   ): Promise<HttpResponse>;
-  /** All submitted reviews on the pull request. */
-  listReviews(repository: string, pullNumber: number): Promise<HttpResponse>;
+  /** All submitted reviews on the pull request. `query` pages the listing
+   * (ticket 05's reconciliation paginates). */
+  listReviews(repository: string, pullNumber: number, query?: { page?: number; perPage?: number }): Promise<HttpResponse>;
   /** Post one review comment on the pull request (its own thread). */
   createReviewComment(
     repository: string,
@@ -163,8 +164,9 @@ export interface GitHubApi {
     },
     signal?: AbortSignal,
   ): Promise<HttpResponse>;
-  /** All review comments on the pull request (any author). */
-  listReviewComments(repository: string, pullNumber: number): Promise<HttpResponse>;
+  /** All review comments on the pull request (any author). `query` pages
+   * the listing (ticket 05's reconciliation paginates). */
+  listReviewComments(repository: string, pullNumber: number, query?: { page?: number; perPage?: number }): Promise<HttpResponse>;
   /** Update one review comment's body. */
   updateReviewComment(
     repository: string,
@@ -454,9 +456,9 @@ export class Publisher {
             ? { ok: true, remote: { reviewId: summaryReview.id } }
             : { ok: false, reason: `updating the summary review ${summaryReview.id} failed with HTTP ${response.status}: ${describeBody(response.body)}` },
         reconcile: async () => {
-          const reviews = await readAllReviews(this.api, subject.repository, subject.pullNumber);
-          if (reviews.length === 0) return { status: "unknown" as const, detail: "listing reviews failed" };
-          const found = reviews.find(
+          const read = await readAllReviews(this.api, subject.repository, subject.pullNumber);
+          if (!read.ok) return { status: "unknown" as const, detail: `listing reviews failed (HTTP ${read.status})` };
+          const found = read.items.find(
             (r) => r.id === summaryReview.id && extractMarkers(r.body).includes(summaryMarker(runId)),
           );
           if (found) return { status: "confirmed" as const, remote: { reviewId: found.id } };
@@ -518,9 +520,9 @@ export class Publisher {
                 ? { ok: true, remote: { commentId: matchedId } }
                 : { ok: false, status: response.status, reason: `updating comment ${matchedId} failed with HTTP ${response.status}: ${describeBody(response.body)}` },
             reconcile: async () => {
-              const comments = await readAllReviewComments(this.api, subject.repository, subject.pullNumber);
-              if (comments.length === 0) return { status: "unknown" as const, detail: "listing review comments failed" };
-              const found = comments.find(
+              const read = await readAllReviewComments(this.api, subject.repository, subject.pullNumber);
+              if (!read.ok) return { status: "unknown" as const, detail: `listing review comments failed (HTTP ${read.status})` };
+              const found = read.items.find(
                 (c) => c.id === matchedId && extractMarkers(c.body).includes(findingMarker(runId, finding.label)),
               );
               if (found) return { status: "confirmed" as const, remote: { commentId: found.id } };
@@ -546,9 +548,9 @@ export class Publisher {
                 ? { ok: true, remote: { commentId: matchedId } }
                 : { ok: false, status: response.status, reason: `marking comment ${matchedId} superseded failed with HTTP ${response.status}: ${describeBody(response.body)}` },
             reconcile: async () => {
-              const comments = await readAllReviewComments(this.api, subject.repository, subject.pullNumber);
-              if (comments.length === 0) return { status: "unknown" as const, detail: "listing review comments failed" };
-              const found = comments.find((c) => c.id === matchedId && isSupersededCommentText(c.body));
+              const read = await readAllReviewComments(this.api, subject.repository, subject.pullNumber);
+              if (!read.ok) return { status: "unknown" as const, detail: `listing review comments failed (HTTP ${read.status})` };
+              const found = read.items.find((c) => c.id === matchedId && isSupersededCommentText(c.body));
               if (found) return { status: "confirmed" as const, remote: { commentId: found.id } };
               return { status: "not_found" as const };
             },
@@ -630,9 +632,9 @@ export class Publisher {
         };
       },
       reconcile: async () => {
-        const reviews = await readAllReviews(this.api, run.subject.repository, run.subject.pullNumber);
-        if (reviews.length === 0) return { status: "unknown" as const, detail: "listing reviews failed" };
-        const found = reviews.find(
+        const read = await readAllReviews(this.api, run.subject.repository, run.subject.pullNumber);
+        if (!read.ok) return { status: "unknown" as const, detail: `listing reviews failed (HTTP ${read.status})` };
+        const found = read.items.find(
           (r) => extractMarkers(r.body).includes(summaryMarker(run.runId)) && r.commitId === run.subject.headSha,
         );
         if (found) {
@@ -698,9 +700,9 @@ export class Publisher {
         return { ok: true, remote: { commentId: created.id } };
       },
       reconcile: async () => {
-        const comments = await readAllReviewComments(this.api, subject.repository, subject.pullNumber);
-        if (comments.length === 0) return { status: "unknown" as const, detail: "listing review comments failed" };
-        const found = comments.find(
+        const read = await readAllReviewComments(this.api, subject.repository, subject.pullNumber);
+        if (!read.ok) return { status: "unknown" as const, detail: `listing review comments failed (HTTP ${read.status})` };
+        const found = read.items.find(
           (c) => extractMarkers(c.body).includes(marker) && c.commitId === subject.headSha,
         );
         if (found) return { status: "confirmed" as const, remote: { commentId: found.id } };
@@ -732,15 +734,39 @@ export class Publisher {
     reconcile: () => Promise<ReconcileResult>;
   }): Promise<PublicationRemote> {
     const hooks = this.ledgerHooks;
+    const opKey = operationKey(input.intent, input.runId, input.subjectKey);
     let attempts = 0;
     let rateLimitStreak = 0;
     let lostRounds = 0;
+    if (hooks) {
+      const existing = await hooks.ledger.op(opKey, hooks.context);
+      // Already confirmed under an earlier attempt of this run: the write is
+      // done; nothing is sent again.
+      if (existing?.state === "confirmed") return existing.remote ?? {};
+      attempts = existing?.attempts ?? 0;
+      // A prior attempt wrote under this key and its outcome was never
+      // recorded (the host crashed, or the response was lost): check GitHub
+      // before retrying — the object is adopted when it landed, and the
+      // write only re-issued when the listing proves it did not.
+      if (existing && existing.attempts > 0) {
+        const outcome = await input.reconcile();
+        if (outcome.status === "confirmed") {
+          await hooks.ledger.confirmFromState(opKey, outcome.remote, hooks.context);
+          return outcome.remote;
+        }
+        if (outcome.status === "unknown") {
+          throw new WriteOutcomeUnknown(
+            `publication write ${input.intent}/${input.subjectKey} could not be reconciled: ${outcome.detail ?? "GitHub state unreadable"}`,
+          );
+        }
+      }
+    }
     for (;;) {
       attempts += 1;
       if (hooks) {
         await hooks.ledger.recordIntent(
           {
-            opKey: operationKey(input.intent, input.runId, input.subjectKey),
+            opKey,
             runId: input.runId,
             intent: input.intent,
             subject: input.subjectKey,
@@ -777,11 +803,7 @@ export class Publisher {
         const outcome = await input.reconcile();
         if (outcome.status === "confirmed") {
           if (hooks) {
-            await hooks.ledger.confirmFromState(
-              operationKey(input.intent, input.runId, input.subjectKey),
-              outcome.remote,
-              hooks.context,
-            );
+            await hooks.ledger.confirmFromState(opKey, outcome.remote, hooks.context);
           }
           return outcome.remote;
         }
@@ -793,16 +815,12 @@ export class Publisher {
       const verdict = input.ok(response);
       if (verdict.ok) {
         if (hooks) {
-          await hooks.ledger.confirm(
-            operationKey(input.intent, input.runId, input.subjectKey),
-            verdict.remote,
-            hooks.context,
-          );
+          await hooks.ledger.confirm(opKey, verdict.remote, hooks.context);
         }
         return verdict.remote;
       }
       const status = verdict.status;
-      if (status !== undefined && isRateLimited(status)) {
+      if (status !== undefined && isRateLimited(status, (response as unknown as { headers?: Record<string, string> }).headers)) {
         rateLimitStreak += 1;
         if (rateLimitStreak > MAX_RATE_LIMIT_RESPONSES) {
           throw new PublishError(verdict.reason);
