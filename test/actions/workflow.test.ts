@@ -35,7 +35,7 @@ const ENTRY = readFileSync(ENTRY_PATH, "utf8");
 /** Collapse whitespace so assertions pin structure, not formatting. */
 function normalized(text: string): string {
   return text
-    .split("\n")
+    .split(/\r?\n/)
     .map((line) => line.replace(/^[ \t]+/, "").replace(/[ \t]+/g, " "))
     .join("\n")
     .replace(/\n+/g, "\n");
