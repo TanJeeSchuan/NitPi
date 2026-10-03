@@ -47,4 +47,9 @@ export class RestGitHubApi implements GitHubApi {
       `/repos/${repository}/collaborators/${encodeURIComponent(username)}/permission`,
     );
   }
+
+  /** Check runs at one commit: the named-check wait for automatic reviews. */
+  listCheckRunsForHead(repository: string, headSha: string) {
+    return this.request<unknown>("GET", `/repos/${repository}/commits/${headSha}/check-runs`);
+  }
 }

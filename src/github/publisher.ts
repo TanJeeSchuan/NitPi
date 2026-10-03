@@ -35,7 +35,7 @@ export interface GitHubApi {
           name: string;
           head_sha: string;
           status: "completed";
-          conclusion: "success" | "failure";
+          conclusion: "success" | "failure" | "skipped" | "action_required";
           output: { title: string; summary: string };
         },
   ): Promise<{ status: number; body: unknown }>;
@@ -44,7 +44,13 @@ export interface GitHubApi {
   getCollaboratorPermission(
     repository: string,
     username: string,
-  ): Promise<{ status: number; body: unknown }>;
+  ): Promise<{ status: number; body: unknown }>
+
+  /**
+   * Check runs at one commit (named-check wait for automatic reviews,
+   * ticket 03). Undefined when the transport has no such route.
+   */
+  listCheckRunsForHead?(repository: string, headSha: string): Promise<{ status: number; body: unknown }>;
 }
 
 export interface PublishedResult {
@@ -164,6 +170,30 @@ export class Publisher {
     });
     if (response.status !== 201) {
       throw new PublishError(`check-run completion failed with HTTP ${response.status}`);
+    }
+  }
+
+  /**
+   * Refused by the trigger gate (ticket 03): the requester is told why and
+   * what to do next, surfaced as a skipped or action-required check.
+   */
+  async checkRefused(
+    subject: { repository: string; pullNumber: number; headSha: string; baseSha?: string },
+    outcome: "skipped" | "action_required",
+    reason: string,
+  ): Promise<void> {
+    const response = await this.api.createCheckRun(subject.repository, {
+      name: CHECK_NAME,
+      head_sha: subject.headSha,
+      status: "completed",
+      conclusion: outcome,
+      output: {
+        title: outcome === "skipped" ? "Review skipped" : "Review action required",
+        summary: reason,
+      },
+    });
+    if (response.status !== 201) {
+      throw new PublishError(`refusal check run failed with HTTP ${response.status}`);
     }
   }
 }

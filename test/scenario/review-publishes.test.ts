@@ -134,7 +134,7 @@ describe("scenario: /review publishes a two-stage review", () => {
         pullNumber: 7,
         requester: "outsider",
       });
-      expect(refused.refused).toContain("does not have write access");
+      expect(refused.refused).toContain("is not a repository writer or maintainer");
 
       const wrongRepo = await stage.host.handleReviewCommand({
         repository: "example/other",

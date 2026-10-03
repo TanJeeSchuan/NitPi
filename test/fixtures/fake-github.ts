@@ -12,6 +12,14 @@ export interface FakePullRequest {
   headSha: string;
   baseSha: string;
   state: "open" | "closed";
+  /** Draft pull requests get no automatic review. */
+  draft?: boolean;
+  /** Head repository full name; differs from `baseRepo` on fork pulls. */
+  headRepo?: string;
+  baseRepo?: string;
+  /** Head ref name, for fork-push realism (unused by the gate itself). */
+  headRef?: string;
+  baseRef?: string;
 }
 
 export interface FakeReview {
@@ -40,6 +48,11 @@ export interface FakeGitHubState {
   dropNextWrite: { match: RegExp; remaining: number };
   /** 422 detail for malformed anchors. */
   validationErrors: Map<string, string>;
+  /**
+   * External check status per head SHA (named-check wait). Keyed
+   * `headSha|name` → "in_progress" | "completed" (+ conclusion).
+   */
+  externalChecks: Map<string, "in_progress" | "completed:success" | "completed:failure" | "completed:neutral">;
 }
 
 export class FakeGitHub {
@@ -58,6 +71,7 @@ export class FakeGitHub {
       checks: [],
       dropNextWrite: { match: /reviews$/, remaining: 0 },
       validationErrors: new Map(),
+      externalChecks: new Map(),
     };
   }
 
@@ -172,12 +186,33 @@ export class FakeGitHub {
         this.respond(response, 404, { message: "Not Found" });
         return;
       }
+      const repo = { full_name: pull.headRepo ?? pull.baseRepo ?? "example/widgets" };
+      const baseRepo = { full_name: pull.baseRepo ?? "example/widgets" };
       this.respond(response, 200, {
         number: pull.number,
         state: pull.state,
-        head: { sha: pull.headSha },
-        base: { sha: pull.baseSha },
+        draft: pull.draft ?? false,
+        head: { sha: pull.headSha, ref: pull.headRef ?? "feature", repo },
+        base: { sha: pull.baseSha, ref: pull.baseRef ?? "main", repo: baseRepo },
       });
+      return;
+    }
+
+    const checkRunsMatch = path.match(/^\/repos\/[^/]+\/[^/]+\/commits\/([0-9a-f]+)\/check-runs$/);
+    if (method === "GET" && checkRunsMatch) {
+      const headSha = checkRunsMatch[1] ?? "";
+      const runs: Array<Record<string, unknown>> = [];
+      for (const [key, status] of this.state.externalChecks) {
+        const [sha, name] = key.split("|");
+        if (sha !== headSha || !name) continue;
+        const completed = status.startsWith("completed:");
+        runs.push({
+          name,
+          status: completed ? "completed" : "in_progress",
+          conclusion: completed ? status.split(":")[1] : null,
+        });
+      }
+      this.respond(response, 200, { total_count: runs.length, check_runs: runs });
       return;
     }
 
