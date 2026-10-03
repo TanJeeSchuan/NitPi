@@ -91,7 +91,7 @@ describe("scenario: /review publishes a two-stage review", () => {
         pullNumber: 7,
         requester: "outsider",
       });
-      expect(refused.refused).toContain("does not have write access");
+      expect(refused.refused).toContain("is not a repository writer or maintainer");
 
       const wrongRepo = await stage.host.handleReviewCommand({
         repository: "example/other",
@@ -144,9 +144,11 @@ describe("scenario: /review publishes a two-stage review", () => {
     expect(review.comments[0]!.body).toContain("src/handler.ts | RIGHT | 3");
 
     // Check outcome: in progress with head and current stage while running,
-    // success after confirmed publication, regardless of findings.
+    // success after confirmed publication, regardless of findings. (Earlier
+    // scenarios in this file post refusal checks on the same head — ticket 03's
+    // gate posts them; the run's own checks are the in_progress ones.)
     const checks = stage.fake.state.checks.filter((c) => c.headSha === repo.headSha);
-    const firstCheck = checks[0]!;
+    const firstCheck = checks.find((c) => c.state === "in_progress")!;
     expect(firstCheck.state).toBe("in_progress");
     expect(firstCheck.summary).toContain("stage: primary");
     expect(checks.at(-1)).toMatchObject({ state: "success" });

@@ -50,6 +50,12 @@ export interface RunDocument {
   runId: string;
   /** Mode `normal`; `/review clean` is ticket 07. */
   mode: "normal";
+  /** What started the run: a writer's command or an automatic event (ticket 03). */
+  source?: "command" | "automatic";
+  /** Who asked (login), for command sources. */
+  requester?: string;
+  /** Human-readable original trigger, recorded for audit. */
+  triggeredBy?: string;
   phase: RunPhase;
   subject: {
     repository: string;
@@ -89,7 +95,7 @@ export interface RunDocument {
   /** Per-stage unchanged checkouts of the reviewed head. */
   checkouts?: { primary: string; reReview: string };
   usage?: RunUsage;
-  checkStatus: "in progress" | "success" | "failure";
+  checkStatus: "in progress" | "success" | "failure" | "skipped";
   checkDetail?: string;
   error?: string;
 }

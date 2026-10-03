@@ -53,6 +53,31 @@ describe("review host configuration", () => {
     expect(() => resolveConfig(noToken)).toThrow(ConfigError);
   });
 
+  it("validates automatic-mode configuration explicitly", () => {
+    const noEvents = baseConfig();
+    (noEvents as { autoMode?: unknown }).autoMode = { mode: "automatic" };
+    expect(() => resolveConfig(noEvents)).toThrow(ConfigError);
+    expect(() => resolveConfig(noEvents)).toThrow(/events is required/);
+
+    const badToggle = baseConfig();
+    (badToggle as { autoMode?: unknown }).autoMode = {
+      mode: "automatic",
+      events: { opened: true, reopened: true, synchronize: "yes", readyForReview: true },
+    };
+    expect(() => resolveConfig(badToggle)).toThrow(ConfigError);
+    expect(() => resolveConfig(badToggle)).toThrow(/must be a boolean/);
+
+    const emptyCheckName = baseConfig();
+    (emptyCheckName as { autoMode?: unknown }).autoMode = {
+      mode: "manual",
+      events: { opened: false, reopened: false, synchronize: false, readyForReview: false },
+      waitForChecks: ["  "],
+    };
+    // Garbage check names are rejected in every mode, so a later flip to
+    // automatic does not silently ignore the typo.
+    expect(() => resolveConfig(emptyCheckName)).toThrow(ConfigError);
+  });
+
   it("requires pinned repository instructions and a checkout source", () => {
     const noInstructions = baseConfig();
     (noInstructions as { repositoryInstructions: string }).repositoryInstructions = "  ";

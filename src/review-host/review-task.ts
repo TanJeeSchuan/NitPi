@@ -48,6 +48,10 @@ export interface ReviewRunRequest {
   readonly headSha: string;
   /** `/review` only in ticket 01 (`clean` is ticket 07, `cancel` ticket 09). */
   readonly command: "/review";
+  /** What started the run (ticket 03): a command or an automatic event. */
+  readonly source: "command" | "automatic";
+  /** Human-readable original trigger recorded on the run document. */
+  readonly triggeredBy: string;
 }
 
 /** Process-wide host wiring consumed by task phases. */

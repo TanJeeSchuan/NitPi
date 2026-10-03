@@ -105,6 +105,11 @@ export class RestGitHubApi implements GitHubApi {
     );
   }
 
+  /** Check runs at one commit: the named-check wait for automatic reviews (ticket 03). */
+  listCheckRunsForHead(repository: string, headSha: string) {
+    return this.request<unknown>("GET", `/repos/${repository}/commits/${headSha}/check-runs`);
+  }
+
   getAuthenticatedUser() {
     return this.request<unknown>("GET", "/user");
   }
