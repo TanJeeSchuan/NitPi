@@ -31,7 +31,7 @@ import type { Context } from "@earendil-works/chord";
 import { TODO_CONTEXT } from "@earendil-works/chord/context";
 import { createHash } from "node:crypto";
 import type { Conversation, Harness } from "@earendil-works/pi-durable";
-import { defineTask } from "@earendil-works/pi-durable";
+import { defineTask, type RunningTask, type TaskRuntime } from "@earendil-works/pi-durable";
 import { Publisher, PublishError } from "../github/publisher.js";
 import type { GitHubApi } from "../github/publisher.js";
 import { parseFinalReview } from "./artifact.js";
@@ -273,18 +273,7 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
         // the matching turn (publication preparation) entirely.
         const stale = await publicationStaleness(host, runDoc);
         if (stale) {
-          await recordStaleSkip(host, task.input.runId, context, stale);
-          await runtime.commit(
-            (_tx) =>
-              ({
-                status: "terminal" as const,
-                outcome: {
-                  status: "completed" as const,
-                  result: { published: false as const, reason: stale },
-                },
-              }) as const,
-            context,
-          );
+          await finishStaleSkip(host, task, runtime, context, stale);
           return;
         }
         const publisher = new Publisher(host.api);
@@ -353,18 +342,7 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
       // close) landing between the match-phase check and here is caught now.
       const stale = await publicationStaleness(host, runDoc);
       if (stale) {
-        await recordStaleSkip(host, task.input.runId, context, stale);
-        await runtime.commit(
-          (_tx) =>
-            ({
-              status: "terminal" as const,
-              outcome: {
-                status: "completed" as const,
-                result: { published: false as const, reason: stale },
-              },
-            }) as const,
-          context,
-        );
+        await finishStaleSkip(host, task, runtime, context, stale);
         return;
       }
       const publisher = new Publisher(host.api);
@@ -460,21 +438,37 @@ async function publicationStaleness(
   return undefined;
 }
 
-/** Terminal "GitHub skipped": keep the frozen review in history (attributed
- * to the run's own head), report skipped, and write nothing to GitHub — no
- * check runs, reviews, comments or thread changes (ticket 08). */
-async function recordStaleSkip(
+/** The run task's runtime, for the shared stale fence below. */
+type ReviewRuntime = TaskRuntime<ReviewTaskInput, ReviewCheckpoint, ReviewTaskResult, object>;
+
+/** Shared stale fence (ticket 08): mark the run "GitHub skipped" — the
+ * frozen review stays in history attributed to the run's own head — and
+ * complete the task without publishing. No GitHub writes happen: no check
+ * runs, reviews, comments or thread changes. */
+async function finishStaleSkip(
   host: ReviewTaskDeps,
-  runId: string,
+  task: RunningTask<ReviewTaskInput, ReviewCheckpoint, ReviewTaskResult>,
+  runtime: ReviewRuntime,
   context: Context,
   reason: string,
 ): Promise<void> {
-  await commitRunUpdate(host, runId, context, (run) => ({
+  await commitRunUpdate(host, task.input.runId, context, (run) => ({
     ...run,
     phase: "GitHub skipped" as const,
     checkStatus: "skipped" as const,
     checkDetail: reason,
   }));
+  await runtime.commit(
+    (_tx) =>
+      ({
+        status: "terminal" as const,
+        outcome: {
+          status: "completed" as const,
+          result: { published: false as const, reason },
+        },
+      }) as const,
+    context,
+  );
 }
 
 /** Record a stage failure on the run document and GitHub, then rethrow so the

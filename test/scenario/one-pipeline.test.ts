@@ -200,6 +200,22 @@ async function queuePush(stage: Stage, deliveryKey: string): Promise<void> {
   expect(sync.outcome).toBe("queued");
 }
 
+/** Push a commit while the given stage's first turn holds its response open,
+ * then deliver the synchronize event into the PR's pending slot. The held
+ * turn guarantees the event is processed inside the active run. */
+async function pushDuringHeldTurn(
+  stage: Stage,
+  held: "primaryStub" | "reReviewStub",
+  deliveryKey: string,
+  summary: string,
+): Promise<string> {
+  await waitFor(() => (stage[held].served >= 1 ? true : undefined));
+  const sha = pushCommit(summary);
+  stage.pull.headSha = sha;
+  await queuePush(stage, deliveryKey);
+  return sha;
+}
+
 describe("scenario: one review at a time, pushes queue, stale results stay off GitHub (ticket 08)", () => {
   it("a push during primary review does not interrupt it; the pushed head is reviewed next", async () => {
     await withStage(twoRunScripts("primary"), async (stage) => {
@@ -212,10 +228,7 @@ describe("scenario: one review at a time, pushes queue, stale results stay off G
       expect(started.runId).toBeTruthy();
 
       // Push while the primary reviewer's first turn is still open.
-      await waitFor(() => (stage.primaryStub.served >= 1 ? true : undefined));
-      const pushedSha = pushCommit("pushed during primary");
-      stage.pull.headSha = pushedSha;
-      await queuePush(stage, "t08-primary-sync-1");
+      const pushedSha = await pushDuringHeldTurn(stage, "primaryStub", "t08-primary-sync-1", "pushed during primary");
 
       // Run 1 finishes on its own head; the pushed head's run starts next.
       await awaitRunTerminal(stage.host, started.runId);
@@ -248,10 +261,7 @@ describe("scenario: one review at a time, pushes queue, stale results stay off G
       expect(started.runId).toBeTruthy();
 
       // Push while the re-reviewer's first turn is still open.
-      await waitFor(() => (stage.reReviewStub.served >= 1 ? true : undefined));
-      const pushedSha = pushCommit("pushed during re-review");
-      stage.pull.headSha = pushedSha;
-      await queuePush(stage, "t08-rereview-sync-1");
+      const pushedSha = await pushDuringHeldTurn(stage, "reReviewStub", "t08-rereview-sync-1", "pushed during re-review");
 
       await awaitRunTerminal(stage.host, started.runId);
       const second = await waitFor(() =>
@@ -282,13 +292,11 @@ describe("scenario: one review at a time, pushes queue, stale results stay off G
       await waitFor(() => (stage.primaryStub.served >= 1 ? true : undefined));
       // Three pushes during the one active run, each delivered as its own
       // synchronize event; the pending slot keeps only the newest.
-      const pushed: string[] = [];
-      for (const label of ["a", "b", "c"]) {
-        const sha = pushCommit(`pushed ${label} during run 1`);
-        stage.pull.headSha = sha;
-        pushed.push(sha);
-        await queuePush(stage, `t08-three-sync-${label}`);
-      }
+      const pushed = [
+        await pushDuringHeldTurn(stage, "primaryStub", "t08-three-sync-a", "pushed a during run 1"),
+        await pushDuringHeldTurn(stage, "primaryStub", "t08-three-sync-b", "pushed b during run 1"),
+        await pushDuringHeldTurn(stage, "primaryStub", "t08-three-sync-c", "pushed c during run 1"),
+      ];
 
       await awaitRunTerminal(stage.host, started.runId);
       const second = await waitFor(() =>
