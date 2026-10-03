@@ -44,7 +44,7 @@ export function protocolInstructions(role: "primary" | "re-review"): string {
 - You may add issues you come across while checking (and checks that surfaced them). Do not run a separate search for missed issues.
 - Write your final review in Markdown with ONE FINDING PER SECTION. Each section: a heading naming the finding, an explanation, evidence (which may cite unchanged code, with paths and base/head lines), and an inline location on its own final line in the exact form: path, then side LEFT or RIGHT, then a one-based line number, separated by " | " (example: src/x/y.ts | RIGHT | 42).
 - After the final review, write audit notes: for each finding label (F1, F2, ...) record retained, amended, rejected, merged or added, quoting the primary's original text for whatever you touched. Label findings F1, F2, ... in order when the primary provided no labels.
-- The matching rule is fixed: matching cannot change the frozen findings.`;
+- After your final review is frozen, a matching turn may follow in this same conversation: it lists the pull request's earlier published review comments (id, anchor, text), which were all written by the reviewer bot. Reply with only the match list — exactly one line per finding label of your final review, in the exact form \`F1 -> 12345\` (the earlier comment this finding corresponds to by meaning) or \`F2 -> none\` (nothing matches). Matching is publication bookkeeping only: it cannot change the frozen findings, their anchors, or the audit notes.`;
 }
 
 export interface ResolvedInstructions {

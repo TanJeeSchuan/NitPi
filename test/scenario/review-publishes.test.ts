@@ -7,45 +7,35 @@
  * Everything inside the host runs for real: Pi Durable on a SQLite file, the
  * provider bridge over AI SDK streamText, run documents, per-stage checkouts,
  * and the publisher.
+ *
+ * Each test gets its own fake GitHub (and stubs and host): a pull request's
+ * threads now persist across runs, so scenarios must not share a PR.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { TODO_CONTEXT } from "@earendil-works/chord/context";
 import { join } from "node:path";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { openReviewHost, type ReviewHost } from "../../src/review-host/review-host.js";
-import { FakeGitHub } from "../fixtures/fake-github.js";
-import { ModelStub, type StubScript } from "../fixtures/model-stub.js";
+import { type StubScript } from "../fixtures/model-stub.js";
 import { createGitRepoFixture, type GitRepoFixture } from "../fixtures/git-fixture.js";
+import {
+  closeScenarioStage,
+  firstSystemMessage,
+  firstUserMessage,
+  openScenarioStage,
+  runReview,
+  type ScenarioStage,
+} from "../helpers/scenario-stage.js";
 
 let workspace: string;
 let repo: GitRepoFixture;
-let fakeGithub: FakeGitHub;
-let githubBase: string;
 
 beforeAll(async () => {
   workspace = mkdtempSync(join(tmpdir(), "nitpi-host-"));
   repo = createGitRepoFixture();
-  fakeGithub = new FakeGitHub(
-    [
-      {
-        number: 7,
-        headSha: repo.headSha,
-        baseSha: repo.baseSha,
-        state: "open",
-      },
-    ],
-    [
-      // The reviewed diff: handler.ts lines 3 and 5 added on RIGHT (head checkout).
-      "src/handler.ts#RIGHT#3",
-      "src/handler.ts#RIGHT#5",
-    ],
-  );
-  githubBase = await fakeGithub.listen();
 });
 
 afterAll(async () => {
-  await fakeGithub.close();
   repo.dispose();
   try {
     rmSync(workspace, { recursive: true, force: true });
@@ -55,42 +45,9 @@ afterAll(async () => {
   }
 });
 
-interface Stage {
-  primaryStub: ModelStub;
-  reReviewStub: ModelStub;
-  host: ReviewHost;
+async function openStage(primaryScript: StubScript, reReviewScript: StubScript): Promise<ScenarioStage> {
+  return openScenarioStage(repo, { primary: primaryScript, reReview: reReviewScript, workspace });
 }
-
-async function openHost(primaryScript: StubScript, reReviewScript: StubScript): Promise<Stage> {
-  const primaryStub = new ModelStub(primaryScript, "stub-primary");
-  const reReviewStub = new ModelStub(reReviewScript, "stub-rereview");
-  const [primaryBase, reReviewBase] = await Promise.all([primaryStub.listen(), reReviewStub.listen()]);
-  const host = await openReviewHost(
-    {
-      repository: "example/widgets",
-      pullNumber: 7,
-      githubToken: "test-token",
-      githubBaseUrl: githubBase,
-      primary: {
-        baseUrl: `${primaryBase}/v1`,
-        modelId: "stub-primary",
-        apiKey: "stub-primary-key",
-      },
-      reReview: {
-        baseUrl: `${reReviewBase}/v1`,
-        modelId: "stub-rereview",
-        apiKey: "stub-rereview-key",
-      },
-      repositoryInstructions: "Be strict about unused parameters.",
-      repositoryInstructionsRevision: repo.baseSha,
-      headCheckoutSource: repo.headCheckout(),
-    },
-    join(workspace, `run-${Math.random().toString(36).slice(2)}.sqlite`),
-  );
-  return { primaryStub, reReviewStub, host };
-}
-
-const HANDLER_HEAD_BODY = ["export function handler(input: string): string {", "  const parts = input.split(',');", "  let result = '';"].join("\n");
 
 const PRIMARY_ARTIFACT = [
   "## Review artifact",
@@ -125,10 +82,10 @@ const FINAL_REVIEW = [
 
 describe("scenario: /review publishes a two-stage review", () => {
   it("runs the trigger gate: refuses non-writers and other repositories", async () => {
-    const stage = await openHost([], []);
+    const stage = await openStage([], []);
     try {
       // A non-writer's /review is refused before anything runs.
-      fakeGithub.collaboratorPermissions["outsider"] = "read";
+      stage.fake.collaboratorPermissions["outsider"] = "read";
       const refused = await stage.host.handleReviewCommand({
         repository: "example/widgets",
         pullNumber: 7,
@@ -142,8 +99,9 @@ describe("scenario: /review publishes a two-stage review", () => {
         requester: "octocat",
       });
       expect(wrongRepo.refused).toContain("not configured");
+      expect(stage.fake.publishedReviews(7)).toHaveLength(0);
     } finally {
-      await stage.host.close();
+      await closeScenarioStage(stage);
     }
   });
 
@@ -159,7 +117,7 @@ describe("scenario: /review publishes a two-stage review", () => {
       { toolCall: { id: "call-2", name: "read", input: JSON.stringify({ path: "src/handler.ts" }) } },
       { text: [FINAL_REVIEW], finishReason: "stop" as const, usage: { promptTokens: 200, completionTokens: 90 } },
     ];
-    const stage = await openHost(primaryScript, reReviewScript);
+    const stage = await openStage(primaryScript, reReviewScript);
 
     const started = await stage.host.handleReviewCommand({
       repository: "example/widgets",
@@ -169,7 +127,7 @@ describe("scenario: /review publishes a two-stage review", () => {
     await stage.host.waitForRun(started.runId);
 
     // GitHub: exactly one submitted review anchored at the reviewed head.
-    const reviews = fakeGithub.publishedReviews(7);
+    const reviews = stage.fake.publishedReviews(7);
     expect(reviews).toHaveLength(1);
     const review = reviews[0]!;
     expect(review.event).toBe("COMMENT");
@@ -187,7 +145,7 @@ describe("scenario: /review publishes a two-stage review", () => {
 
     // Check outcome: in progress with head and current stage while running,
     // success after confirmed publication, regardless of findings.
-    const checks = fakeGithub.state.checks.filter((c) => c.headSha === repo.headSha);
+    const checks = stage.fake.state.checks.filter((c) => c.headSha === repo.headSha);
     const firstCheck = checks[0]!;
     expect(firstCheck.state).toBe("in_progress");
     expect(firstCheck.summary).toContain("stage: primary");
@@ -262,7 +220,7 @@ describe("scenario: /review publishes a two-stage review", () => {
     expect(reUser).toContain("FROZEN PRIMARY REVIEW ARTIFACT");
     expect(reUser).toContain("The loop in handler() rebuilds result by concatenation");
 
-    await stage.host.close();
+    await closeScenarioStage(stage);
   });
 
   it("publishes a zero-finding review and the check succeeds", async () => {
@@ -281,23 +239,18 @@ describe("scenario: /review publishes a two-stage review", () => {
         finishReason: "stop" as const,
       },
     ];
-    const stage = await openHost(primaryScript, reReviewScript);
+    const stage = await openStage(primaryScript, reReviewScript);
 
-    const started = await stage.host.handleReviewCommand({
-      repository: "example/widgets",
-      pullNumber: 7,
-      requester: "octocat",
-    });
-    await stage.host.waitForRun(started.runId);
+    await runReview(stage);
 
-    const reviews = fakeGithub.publishedReviews(7);
-    // This scenario's review lands after the first scenario's.
+    const reviews = stage.fake.publishedReviews(7);
+    // Fresh fake for this test: this run's review is the only one.
     const mine = reviews[reviews.length - 1]!;
     expect(mine.event).toBe("COMMENT");
     expect(mine.commitId).toBe(repo.headSha);
     expect(mine.body).toContain("0 findings");
     expect(mine.comments).toHaveLength(0);
-    expect(fakeGithub.state.checks.at(-1)).toMatchObject({ state: "success", headSha: repo.headSha });
+    expect(stage.fake.state.checks.at(-1)).toMatchObject({ state: "success", headSha: repo.headSha });
 
     const runs = await stage.host.runHistory().allRuns({} as never);
     const run = runs.at(-1)!;
@@ -305,7 +258,7 @@ describe("scenario: /review publishes a two-stage review", () => {
     expect(run.artifact).toContain("No issues found");
     expect(run.findings).toEqual([]);
 
-    await stage.host.close();
+    await closeScenarioStage(stage);
   });
 
   it("fails explicitly when the endpoint does not support tool calls; no fallback model", async () => {
@@ -313,7 +266,7 @@ describe("scenario: /review publishes a two-stage review", () => {
     const primaryScript: StubScript = [
       { kind: "error", status: 400, body: { error: { message: "tools are not supported", code: "invalid_request_error" } } },
     ];
-    const stage = await openHost(primaryScript, []);
+    const stage = await openStage(primaryScript, []);
 
     const trigger = await stage.host.handleReviewCommand({
       repository: "example/widgets",
@@ -323,32 +276,19 @@ describe("scenario: /review publishes a two-stage review", () => {
     await expect(stage.host.waitForRun(trigger.runId)).rejects.toThrow(/tools are not supported/i);
 
     // No publication, and the re-review endpoint was never called (no fallback).
-    expect(fakeGithub.publishedReviews(7).length).toBe(2); // only the previous scenarios'
+    expect(stage.fake.publishedReviews(7)).toHaveLength(0);
     // The run recorded the failure and the check failed.
     const runs = await stage.host.runHistory().allRuns({} as never);
     const run = runs.at(-1)!;
     expect(run.error).toContain("tools are not supported");
-    expect(fakeGithub.state.checks.at(-1)).toMatchObject({ state: "failure", headSha: repo.headSha });
+    expect(stage.fake.state.checks.at(-1)).toMatchObject({ state: "failure", headSha: repo.headSha });
 
-    await stage.host.close();
+    await closeScenarioStage(stage);
   });
 });
 
-/** Wire helpers: extract messages from a recorded chat-completions request. */
-type RecordedMessages = Array<{ role: string; content: unknown }> | undefined;
-
-function firstSystemMessage(messages: RecordedMessages): string {
-  const system = messages?.find((m) => m.role === "system");
-  return typeof system?.content === "string" ? system.content : "";
-}
-
-function firstUserMessage(messages: RecordedMessages): string {
-  const user = messages?.find((m) => m.role === "user");
-  return typeof user?.content === "string" ? user.content : "";
-}
-
 /** Durable-history read: conversations owned by one pipeline task. */
-async function listConversationsOwnedBy(host: ReviewHost, taskId: string): Promise<string[]> {
+async function listConversationsOwnedBy(host: ScenarioStage["host"], taskId: string): Promise<string[]> {
   const history = host.runHistory();
   const page = await history.harness.commit(
     async (tx) => tx.scanConversations({ ownerTaskId: taskId as never }, 50, undefined),

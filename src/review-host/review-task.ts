@@ -9,7 +9,10 @@
  * conversation; the re-reviewer runs in a fresh task-owned conversation
  * created by this task with explicit agent configuration, on its own unchanged
  * checkout. It receives the frozen artifact plus repository and PR inputs —
- * never the primary transcript.
+ * never the primary transcript. After the final review is frozen, one more
+ * matching-only turn in that same conversation assigns current findings to
+ * earlier published comment IDs (ticket 04); the publisher then keeps the
+ * pull request's threads in sync.
  *
  * Module dependencies (`installReviewTaskDeps`) exist because pi-durable
  * resolves task definitions from the registry at invocation: the process-wide
@@ -23,6 +26,11 @@ import { defineTask } from "@earendil-works/pi-durable";
 import { Publisher, PublishError } from "../github/publisher.js";
 import type { GitHubApi } from "../github/publisher.js";
 import { parseFinalReview } from "./artifact.js";
+import {
+  buildMatchPrompt,
+  parseMatchList,
+  type FindingMatch,
+} from "./matching.js";
 import type { ReviewHostConfig } from "./config.js";
 import type { ResolvedInstructions } from "./instructions.js";
 import type { RunDocument, RunHistory } from "./run-history.js";
@@ -62,8 +70,11 @@ export interface ReviewTaskInput {
 }
 
 export interface ReviewCheckpoint {
-  phase: "primary" | "re-review" | "publish";
+  phase: "primary" | "re-review" | "match" | "publish";
 }
+
+/** Usage of one settling assistant message. */
+type RunUsagePart = { input: number; output: number; totalTokens: number };
 
 export type ReviewTaskResult =
   | { readonly published: true; readonly reviewId: number }
@@ -175,6 +186,60 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
         await runtime.commit(
           (_tx, current) => ({
             status: "running" as const,
+            checkpoint: { ...current.state.checkpoint, phase: "match" as const },
+          }),
+          context,
+        );
+      } catch (error) {
+        await failRun(task.input.runId, context, error);
+      }
+    },
+
+    match: async (task, runtime, context) => {
+      try {
+        const host = reviewTaskDeps();
+        const runDoc = await host.runHistory.findRun(task.input.runId, context);
+        if (!runDoc?.finalReview) throw new Error("final review is not frozen");
+        const publisher = new Publisher(host.api);
+        await publisher.checkInProgress(runDoc.subject, "matching");
+
+        // Earlier published findings and their comment IDs, read once: this
+        // is the snapshot the matching turn sees and the same snapshot the
+        // publisher validates model-supplied IDs against.
+        const earlier = await publisher.listPublishedComments(runDoc.subject);
+        const findings = runDoc.findings ?? [];
+        const matches: FindingMatch[] = [];
+        let matchUsage: RunUsagePart | undefined;
+        if (earlier.length > 0 && findings.length > 0) {
+          // One more turn in the SAME re-reviewer conversation; matching
+          // only — it cannot change the frozen findings.
+          if (!runDoc.reReviewConversationId) {
+            throw new Error("re-reviewer conversation is not recorded");
+          }
+          const conversation = await harnessConversation(host.runHistory.harness, runDoc.reReviewConversationId);
+          const botLogin = await publisher.botLogin();
+          const botComments = earlier.filter((c) => c.author === botLogin);
+          await runConversationTurn(conversation, buildMatchPrompt(findings, botComments), context);
+          const answer = await latestAssistant(conversation, context);
+          matches.push(...parseMatchList(answer?.text ?? "", new Set(findings.map((f) => f.label))).matches);
+          matchUsage = answer?.usageSummary;
+        }
+
+        // Durable commits carry strict JSON: include the matching-turn usage
+        // only when the turn ran (it is skipped on first runs and
+        // zero-finding reviews).
+        const usage = matchUsage ? { ...runDoc.usage, matching: matchUsage } : runDoc.usage;
+        await commitRunUpdate(host, task.input.runId, context, (run) => ({
+          ...run,
+          earlierComments: earlier,
+          matches,
+          phase: "matched",
+          ...(usage !== undefined ? { usage } : {}),
+        }));
+
+        await runtime.commit(
+          (_tx, current) => ({
+            status: "running" as const,
             checkpoint: { ...current.state.checkpoint, phase: "publish" as const },
           }),
           context,
@@ -197,11 +262,14 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
           runDoc,
           runDoc.finalReview,
           runDoc.findings ?? [],
+          runDoc.earlierComments ?? [],
+          runDoc.matches ?? [],
           context.abortSignal,
         );
         await commitRunUpdate(host, task.input.runId, context, (run) => ({
           ...run,
           publication: { reviewId: published.reviewId, commentIds: published.commentIds },
+          matchRejections: published.rejections,
           phase: "published",
           checkStatus: "success",
           checkDetail: `published review ${published.reviewId} with ${run.findings?.length ?? 0} finding(s)`,
@@ -335,10 +403,12 @@ export interface TurnAnswer {
   usageSummary: { input: number; output: number; totalTokens: number };
 }
 
-/** Newest assistant entry with text, scanning newest-first. */
+/** The newest assistant entry with text. Entry pages are newest-first, so
+ * return the first hit found; tool-only assistant messages (no text) are
+ * skipped, so the loop keeps walking past them to the newest turn that
+ * actually answered. */
 async function latestAssistant(conversation: Conversation, context: Context): Promise<TurnAnswer | undefined> {
   const page = await conversation.entries({ conversationId: conversation.id } as never, 20, undefined, context);
-  let newest: TurnAnswer | undefined;
   for (const entry of page.items) {
     if (entry.kind !== "pi.assistant") continue;
     for (const message of entry.model ?? []) {
@@ -348,7 +418,7 @@ async function latestAssistant(conversation: Conversation, context: Context): Pr
         .map((c) => c.text)
         .join("");
       if (text.trim()) {
-        newest = {
+        return {
           text,
           usageSummary: {
             input: message.usage.input,
@@ -356,11 +426,10 @@ async function latestAssistant(conversation: Conversation, context: Context): Pr
             totalTokens: message.usage.totalTokens,
           },
         };
-        break;
       }
     }
   }
-  return newest;
+  return undefined;
 }
 
 async function commitRunUpdate(
