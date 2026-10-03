@@ -35,11 +35,18 @@
  * Module dependencies (`installReviewTaskDeps`) exist because pi-durable
  * resolves task definitions from the registry at invocation: the process-wide
  * host wires registry + publisher once before the harness starts work.
+ *
+ * Deliberate cohesion: this module is the pipeline state machine, so the
+ * recovery contract's deadlines (StageTimeout), resume positioning
+ * (initialPhase), strict-JSON usage recording, and anchor-round carry-over
+ * all live here — they are one durable phase-advance behavior, not unrelated
+ * reasons (the code-review question is answered by the phase boundaries
+ * each concern sits behind).
  */
 import type { Context } from "@earendil-works/chord";
 import { TODO_CONTEXT } from "@earendil-works/chord/context";
 import { createHash } from "node:crypto";
-import type { Conversation, Harness, Submission } from "@earendil-works/pi-durable";
+import type { Conversation, Harness, Submission, TaskRuntime } from "@earendil-works/pi-durable";
 import { defineTask } from "@earendil-works/pi-durable";
 import { Publisher, PublishError } from "../github/publisher.js";
 import type { GitHubApi } from "../github/publisher.js";
@@ -51,7 +58,7 @@ import {
 } from "./anchor-validation.js";
 import type { ReviewHostConfig } from "./config.js";
 import type { ResolvedInstructions } from "./instructions.js";
-import type { RunDocument, RunHistory, RunPhase } from "./run-history.js";
+import type { RunDocument, RunHistory, RunPhase, RunUsage } from "./run-history.js";
 
 export interface ReviewRunRequest {
   readonly repository: string;
@@ -119,13 +126,7 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
         // still points at the primary phase → primary model work is done and
         // must not run again; continue with the re-review stage.
         if (runDoc.artifactFrozen && runDoc.artifact) {
-          await runtime.commit(
-            (_tx, current) => ({
-              status: "running" as const,
-              checkpoint: { ...current.state.checkpoint, phase: "re-review" as const },
-            }),
-            context,
-          );
+          await advancePhase(runtime, context, "re-review");
           return;
         }
 
@@ -162,27 +163,16 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
         // Freeze the hand-off: stored unchanged as free-form text.
         const answer = await latestAssistant(canonical, context);
         const artifact = answer?.text ?? "";
-        await commitRunUpdate(host, task.input.runId, context, (run) => {
-          // Strict JSON documents: an absent key (not an undefined value).
-          const usage = { ...run.usage };
-          if (answer?.usageSummary) usage.primary = answer.usageSummary;
-          return {
-            ...run,
-            artifact,
-            artifactFrozen: true,
-            phase: "primary frozen",
-            instructionHashes: { ...run.instructionHashes, primary: sha256(instructions.text) },
-            usage,
-          };
-        });
+        await commitRunUpdate(host, task.input.runId, context, (run) => ({
+          ...run,
+          artifact,
+          artifactFrozen: true,
+          phase: "primary frozen",
+          instructionHashes: { ...run.instructionHashes, primary: sha256(instructions.text) },
+          usage: mergeUsage(run, "primary", answer?.usageSummary),
+        }));
 
-        await runtime.commit(
-          (_tx, current) => ({
-            status: "running" as const,
-            checkpoint: { ...current.state.checkpoint, phase: "re-review" as const },
-          }),
-          context,
-        );
+        await advancePhase(runtime, context, "re-review");
       } catch (error) {
         if (isKilledInvocation(runtime)) return;
         await failRun(task.input, context, error);
@@ -199,13 +189,7 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
         // Cross-commit boundary recovery: the final review froze but the task
         // still points at re-review → go straight to publication.
         if (runDoc.finalReview) {
-          await runtime.commit(
-            (_tx, current) => ({
-              status: "running" as const,
-              checkpoint: { ...current.state.checkpoint, phase: "publish" as const },
-            }),
-            context,
-          );
+          await advancePhase(runtime, context, "publish");
           return;
         }
 
@@ -296,28 +280,18 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
           invalid = validateFindingAnchors(parsed.findings, anchors);
         }
 
-        await commitRunUpdate(host, task.input.runId, context, (run) => {
-          const usage = { ...run.usage };
-          if (answer?.usageSummary) usage.reReview = answer.usageSummary;
-          return {
-            ...run,
-            finalReview: answer?.text ?? "",
-            auditNotes: parsed.auditNotes,
-            findings: parsed.findings,
-            phase: "final frozen",
-            anchorRounds,
-            instructionHashes: { ...run.instructionHashes, reReview: sha256(instructions.text) },
-            usage,
-          };
-        });
+        await commitRunUpdate(host, task.input.runId, context, (run) => ({
+          ...run,
+          finalReview: answer?.text ?? "",
+          auditNotes: parsed.auditNotes,
+          findings: parsed.findings,
+          phase: "final frozen",
+          anchorRounds,
+          instructionHashes: { ...run.instructionHashes, reReview: sha256(instructions.text) },
+          usage: mergeUsage(run, "reReview", answer?.usageSummary),
+        }));
 
-        await runtime.commit(
-          (_tx, current) => ({
-            status: "running" as const,
-            checkpoint: { ...current.state.checkpoint, phase: "publish" as const },
-          }),
-          context,
-        );
+        await advancePhase(runtime, context, "publish");
       } catch (error) {
         if (isKilledInvocation(runtime)) return;
         await failRun(task.input, context, error);
@@ -397,6 +371,33 @@ class StageTimeout extends Error {
     super(`${stage} reviewer exceeded its ${deadlineMs}ms deadline`);
     this.name = "StageTimeout";
   }
+}
+
+/** Advance the pipeline to the next phase as one durable checkpoint. */
+async function advancePhase(
+  runtime: Pick<TaskRuntime<ReviewTaskInput, ReviewCheckpoint, ReviewTaskResult, object>, "commit">,
+  context: Context,
+  phase: "re-review" | "publish",
+): Promise<void> {
+  await runtime.commit(
+    (_tx, current) => ({
+      status: "running" as const,
+      checkpoint: { ...current.state.checkpoint, phase },
+    }),
+    context,
+  );
+}
+
+/** Merge this turn's usage into the run document (strict JSON: absent key,
+ * never an undefined value, when the turn produced no usage). */
+function mergeUsage(
+  run: RunDocument,
+  stage: keyof RunUsage,
+  next: TurnAnswer["usageSummary"] | undefined,
+): RunUsage {
+  const usage: RunUsage = { ...run.usage };
+  if (next) usage[stage] = next;
+  return usage;
 }
 
 /**

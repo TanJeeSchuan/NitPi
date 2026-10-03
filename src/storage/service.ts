@@ -50,6 +50,7 @@ import {
 import { openNodeSqliteDatabase } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { SqliteDatabase } from "@earendil-works/pi-durable/storage/sqlite";
+import type { StoragePartitionId } from "./wire.js";
 
 export interface ReviewStorageServiceOptions {
   /** Directory that holds the per-partition SQLite files. */
@@ -87,7 +88,7 @@ export interface ReviewStorageService {
   /** Test seam: destroy the response of the next matching commit after it durably applied. */
   faultDropCommitResponse(pathIncludes: string): void;
   /** Test seam: the current live lease for a partition, if any. */
-  liveLease(repository: string, pullNumber: number): Lease | undefined;
+  liveLease(id: StoragePartitionId): Lease | undefined;
 }
 
 class ServiceRouteError extends Error {
@@ -111,20 +112,20 @@ export async function startReviewStorageService(
   let dropCommitPath = "";
   let dropCommitRemaining = 0;
 
-  function partitionKey(repository: string, pullNumber: number): string {
-    return `${repository.toLowerCase()}/pr-${pullNumber}`;
+  function partitionKey(id: StoragePartitionId): string {
+    return `${id.repository.toLowerCase()}/pr-${id.pullNumber}`;
   }
 
   function safeDir(repository: string): string {
     return repository.toLowerCase().replace(/[^a-z0-9._-]+/g, "_");
   }
 
-  function partition(key: string, repository: string, pullNumber: number): Partition {
+  function partition(key: string, id: StoragePartitionId): Partition {
     const existing = partitions.get(key);
     if (existing) return existing;
     const record: Partition = {
       key,
-      file: join(options.dataDir, safeDir(repository), `pr-${pullNumber}.sqlite`),
+      file: join(options.dataDir, safeDir(id.repository), `pr-${id.pullNumber}.sqlite`),
       commitLedger: new Map(),
       queue: Promise.resolve(),
     };
@@ -158,28 +159,28 @@ export async function startReviewStorageService(
 
   async function dispatchStorage(storage: Storage, method: string, kind: string | undefined, args: Record<string, unknown>): Promise<unknown> {
     const context = TODO_CONTEXT;
-    const n = (value: unknown) => Number(value);
+    const toNumber = (value: unknown) => Number(value);
     switch (method) {
       case "mintId":
-        return { id: n(await storage.mintId()) };
+        return { id: toNumber(await storage.mintId()) };
       case "conversation":
-        return { record: (await storage.conversation(n(args.id) as ConversationId, context)) ?? absent };
+        return { record: (await storage.conversation(toNumber(args.id) as ConversationId, context)) ?? absent };
       case "scanConversations":
         return {
           page: await storage.scanConversations(
             (args.query ?? {}) as ConversationQuery,
-            n(args.limit),
+            toNumber(args.limit),
             (args.cursor ?? undefined) as Cursor,
             context,
           ),
         };
       case "entry": {
         if (kind === "by-id") {
-          return { result: (await storage.entry(n(args.id) as EntryId, context)) ?? absent };
+          return { result: (await storage.entry(toNumber(args.id) as EntryId, context)) ?? absent };
         }
         const found = await storage.entry(
-          n(args.conversationId) as ConversationId,
-          n(args.id) as EntryId,
+          toNumber(args.conversationId) as ConversationId,
+          toNumber(args.id) as EntryId,
           context,
         );
         return { result: found ?? absent };
@@ -188,8 +189,8 @@ export async function startReviewStorageService(
         return {
           result:
             (await storage.findLatestHeadMarker(
-              n(args.conversationId) as ConversationId,
-              (args.atOrBeforeEntryId == null ? undefined : n(args.atOrBeforeEntryId)) as EntryId | undefined,
+              toNumber(args.conversationId) as ConversationId,
+              (args.atOrBeforeEntryId == null ? undefined : toNumber(args.atOrBeforeEntryId)) as EntryId | undefined,
               context,
             )) ?? absent,
         };
@@ -197,31 +198,31 @@ export async function startReviewStorageService(
         return {
           page: await storage.scanEntries(
             args.query as EntryQuery,
-            n(args.limit),
+            toNumber(args.limit),
             (args.cursor ?? undefined) as Cursor,
             context,
           ),
         };
       case "task":
-        return { record: (await storage.task(n(args.id) as TaskId, context)) ?? absent };
+        return { record: (await storage.task(toNumber(args.id) as TaskId, context)) ?? absent };
       case "scanTasks":
         return {
           page: await storage.scanTasks(
             (args.query ?? {}) as TaskQuery,
-            n(args.limit),
+            toNumber(args.limit),
             (args.cursor ?? undefined) as Cursor,
             context,
           ),
         };
       case "submission":
         return {
-          record: (await storage.submission(n(args.id) as unknown as SubmissionId, context)) ?? absent,
+          record: (await storage.submission(toNumber(args.id) as unknown as SubmissionId, context)) ?? absent,
         };
       case "scanSubmissions":
         return {
           page: await storage.scanSubmissions(
             (args.query ?? {}) as SubmissionQuery,
-            n(args.limit),
+            toNumber(args.limit),
             (args.cursor ?? undefined) as Cursor,
             context,
           ),
@@ -230,7 +231,7 @@ export async function startReviewStorageService(
         return {
           record:
             (await storage.submissionByRequest(
-              n(args.conversationId) as ConversationId,
+              toNumber(args.conversationId) as ConversationId,
               String(args.requestId),
               context,
             )) ?? absent,
@@ -243,13 +244,13 @@ export async function startReviewStorageService(
         };
       case "document":
         return {
-          stored: (await storage.document(n(args.id) as never, args.at as DocumentPoint, context)) ?? absent,
+          stored: (await storage.document(toNumber(args.id) as never, args.at as DocumentPoint, context)) ?? absent,
         };
       case "scanDocuments":
         return {
           page: await storage.scanDocuments(
             args.query as DocumentQuery,
-            n(args.limit),
+            toNumber(args.limit),
             (args.cursor ?? undefined) as Cursor,
             context,
           ),
@@ -306,7 +307,7 @@ export async function startReviewStorageService(
     pullNumber: number;
     leaseId: string;
   }): Promise<Partition | undefined> {
-    const record = partitions.get(partitionKey(body.repository, body.pullNumber));
+    const record = partitions.get(partitionKey(body));
     const lease = record?.lease;
     if (!record || !lease || lease.id !== body.leaseId) return undefined;
     if (lease.expiresAtMs <= Date.now()) {
@@ -395,8 +396,9 @@ export async function startReviewStorageService(
         if (!repository || !Number.isInteger(pullNumber) || pullNumber <= 0) {
           throw new ServiceRouteError(400, "BadRequest", "repository and pullNumber are required");
         }
-        const key = partitionKey(repository, pullNumber);
-        const record = partition(key, repository, pullNumber);
+        const id: StoragePartitionId = { repository, pullNumber };
+        const key = partitionKey(id);
+        const record = partition(key, id);
         if (record.lease && record.lease.expiresAtMs > Date.now()) {
           return respond(response, 409, {
             error: {
@@ -424,7 +426,7 @@ export async function startReviewStorageService(
 
       if (path === "/v1/close" && request.method === "POST") {
         const key = requireKeyOf(await readBody(request));
-        const record = partitions.get(partitionKey(key.repository, key.pullNumber));
+        const record = partitions.get(partitionKey(key));
         if (record?.lease?.id === key.leaseId) record.lease = undefined;
         return respond(response, 204, { ok: true });
       }
@@ -505,8 +507,8 @@ export async function startReviewStorageService(
       dropCommitPath = pathIncludes;
       dropCommitRemaining += 1;
     },
-    liveLease(repository, pullNumber) {
-      return partitions.get(partitionKey(repository, pullNumber))?.lease;
+    liveLease(id) {
+      return partitions.get(partitionKey(id))?.lease;
     },
   };
 }

@@ -6,7 +6,11 @@
  * storage contract (reads plus atomic commit batches)": the suite covers
  * atomic mixed-table commits and rollbacks, cursor pages, fork-aware entry
  * scans, task/submission lifecycle states, document incarnations and
- * revisions, ID namespaces, and post-close rejection.
+ * revisions, ID namespaces, and post-close rejection. This suite drives the
+ * adapter directly by design — pi-durable documents exactly this pattern
+ * for custom backends ("run the shared conformance suite with any
+ * Vitest-compatible runner"). The review-host integration seam is
+ * test/scenario/durable-recovery.test.ts.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";

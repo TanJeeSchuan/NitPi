@@ -1,5 +1,7 @@
 /**
- * Wire encoding for Pi Durable's `Storage` contract over HTTP.
+ * Wire encoding for Pi Durable's `Storage` contract over HTTP (spec ticket
+ * 06: the storage service on the homeserver keeps Pi's state in SQLite,
+ * partitioned by repository and PR).
  *
  * The service owns Pi's actual `SqliteStorage` (the SQLite file lives beside
  * the service, on homelab storage); the client adapter speaks this protocol.
@@ -7,6 +9,12 @@
  * `Seq` likewise. `DocumentPoint` distinguishes `"current"` from a numeric
  * commit sequence. Everything else is plain JSON already.
  */
+
+/** The (repository, pull number) pair one storage partition belongs to. */
+export interface StoragePartitionId {
+  readonly repository: string;
+  readonly pullNumber: number;
+}
 import type {
   ConversationId,
   EntryId,

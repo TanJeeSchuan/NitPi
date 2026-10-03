@@ -185,6 +185,8 @@ export class RemoteStorage implements Storage {
       );
     }
     if (!response.ok) {
+      // The error body may itself be malformed (mid-collapse responses,
+      // proxy truncations); the status and the error name still classify it.
       const payload = (await response.json().catch(() => undefined)) as
         | { error?: { name?: string; message?: string } }
         | undefined;
@@ -202,6 +204,9 @@ export class RemoteStorage implements Storage {
       if (name === "StorageRejected") throw new StorageRejected(message);
       if (name === "ReadAfterWrite") throw restoreReadAfterWrite(message);
       if (name === "ConversationBusy") throw restoreConversationBusy(message);
+      // Not one of the contract's typed channel faults (an infrastructure
+      // classification, not a retryable storage-state error): the plain
+      // error carries the host name and reason verbatim.
       throw new Error(`${name}: ${message}`);
     }
     return response.status === 204 ? undefined : ((await response.json()) as unknown);

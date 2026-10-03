@@ -110,6 +110,22 @@ async function stubServed(
   }
 }
 
+/** Wait until the last GitHub check reaches the given state. */
+async function checkEventually(
+  fake: { readonly state: { readonly checks: ReadonlyArray<{ state: string }> } },
+  state: string,
+  timeoutMs = 10_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (fake.state.checks.at(-1)?.state === state) return;
+    if (Date.now() > deadline) {
+      throw new Error(`the last check never reached "${state}" (got "${fake.state.checks.at(-1)?.state}")`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 /** Kill the runner mid-primary: the artifact has not frozen yet. */
 async function crashMidPrimary(host: ReviewHost, runId: string, jar: ScenarioJar): Promise<void> {
   await stubServed(jar.primaryStub, 1);
@@ -403,14 +419,15 @@ describe("durable recovery (ticket 06)", () => {
     await jar.stopStorage();
 
     // The run stops with an execution failure: nothing more is published and
-    // no stage proceeds. (The runner's attempt may not even answer its
-    // caller — committing the failure outcome needs storage too. Its durable
-    // state and the failure check carry the reason.)
-    if (jar.fakeGithub.state.checks.at(-1)?.state === "failure") {
-      expect(jar.fakeGithub.state.checks.at(-1)?.summary).toContain("storage");
-      expect(jar.fakeGithub.publishedReviews(15)).toHaveLength(0);
-      expect(jar.reReviewStub.requests).toHaveLength(0);
-    }
+    // no stage proceeds. The failure check is written to GitHub without
+    // touching storage (the subject comes from the durable task input), so
+    // these assertions are unconditional: no local continuation, no
+    // publication from uncommitted state.
+    await checkEventually(jar.fakeGithub, "failure");
+    expect(jar.fakeGithub.state.checks.at(-1)?.detail).toBe("Review failed");
+    expect(jar.fakeGithub.state.checks.at(-1)?.summary).toContain("storage");
+    expect(jar.fakeGithub.publishedReviews(15)).toHaveLength(0);
+    expect(jar.reReviewStub.requests).toHaveLength(0);
     // The runner is dead from here: its close races out; whatever hangs on
     // the poisoned session is abandoned, as an Actions runner would be.
     void Promise.race([
@@ -444,6 +461,112 @@ describe("durable recovery (ticket 06)", () => {
     }
   });
 
+  it("primary reviewer error: nothing publishes, the check fails with a reason, and the re-run re-runs only the primary stage onward", { timeout: 90_000 }, async () => {
+    // The PRIMARY stage errors once (host A), then works on the re-run.
+    const jar = await openJar({
+      pullNumber: 19,
+      primaryScript: [
+        { kind: "error", status: 503, body: { error: { message: "primary endpoint melted down" } } },
+        { toolCall: { id: "call-1", name: "read", input: JSON.stringify({ path: "src/handler.ts" }) } },
+        { text: [ARTIFACT], finishReason: "stop" as const },
+      ],
+      reReviewScript: [{ text: [FINAL_REVIEW], finishReason: "stop" as const }],
+    });
+    const hostA = await jar.openHost();
+    let startedRunId = "";
+    try {
+      const started = await hostA.handleReviewCommand({
+        repository: "example/scenario",
+        pullNumber: 19,
+        requester: "octocat",
+      });
+      startedRunId = started.runId;
+      await expect(hostA.waitForRun(started.runId)).rejects.toThrow(/melted down/i);
+
+      // No findings are published; the check fails with the reason.
+      await checkEventually(jar.fakeGithub, "failure");
+      expect(jar.fakeGithub.publishedReviews(19)).toHaveLength(0);
+      expect(jar.fakeGithub.state.checks.at(-1)?.detail).toBe("Review failed");
+      expect(jar.fakeGithub.state.checks.at(-1)?.summary).toContain("melted down");
+      // The re-reviewer was never reached.
+      expect(jar.reReviewStub.requests).toHaveLength(0);
+    } finally {
+      await hostA.close();
+    }
+
+    // The re-run resumes the SAME attempt at the primary stage (it never
+    // froze), the primary completes, and publication follows.
+    const hostB = await jar.openHost();
+    try {
+      const resumed = await hostB.handleReviewCommand({
+        repository: "example/scenario",
+        pullNumber: 19,
+        requester: "octocat",
+      });
+      expect(resumed.runId).toBe(startedRunId);
+      await hostB.waitForRun(resumed.runId);
+      const run = await waitForRunDoc(hostB, resumed.runId, (r) => r.phase === "published");
+      expect(run.artifact).toContain("move it to the boundary");
+      expect(run.finalReview).toContain("Audit notes");
+      expect(jar.fakeGithub.publishedReviews(19)).toHaveLength(1);
+      expect(jar.fakeGithub.state.checks.at(-1)).toMatchObject({ state: "success" });
+      // The primary leg's continuation completed: hung + artifact turns.
+      expect(jar.primaryStub.requests).toHaveLength(3);
+    } finally {
+      await hostB.close();
+    }
+  });
+
+  it("primary reviewer timeout: nothing publishes, the check reports incomplete, durable work kept", { timeout: 90_000 }, async () => {
+    const jar = await openJar({
+      pullNumber: 20,
+      primaryScript: [
+        { kind: "hang" }, // host A's primary turn: the deadline fires
+        { text: [ARTIFACT], finishReason: "stop" as const }, // host B's primary
+        ...EMPTY_TURN,
+      ],
+      reReviewScript: [{ text: [FINAL_REVIEW], finishReason: "stop" as const }],
+      deadlines: { primaryMs: 400, reReviewMs: 60_000 },
+    });
+    const hostA = await jar.openHost();
+    let startedRunId = "";
+    try {
+      const started = await hostA.handleReviewCommand({
+        repository: "example/scenario",
+        pullNumber: 20,
+        requester: "octocat",
+      });
+      startedRunId = started.runId;
+      await expect(hostA.waitForRun(started.runId)).rejects.toThrow(/primary reviewer exceeded/);
+
+      // Nothing published; the check reports incomplete with a reason.
+      await checkEventually(jar.fakeGithub, "neutral");
+      expect(jar.fakeGithub.publishedReviews(20)).toHaveLength(0);
+      expect(jar.fakeGithub.state.checks.at(-1)?.detail).toBe("Review incomplete");
+      expect(jar.fakeGithub.state.checks.at(-1)?.summary).toContain("exceeded its 400ms deadline");
+    } finally {
+      await hostA.close();
+    }
+
+    // The re-run resumes the primary stage and finishes the attempt.
+    const hostB = await jar.openHost();
+    try {
+      const resumed = await hostB.handleReviewCommand({
+        repository: "example/scenario",
+        pullNumber: 20,
+        requester: "octocat",
+      });
+      expect(resumed.runId).toBe(startedRunId);
+      await hostB.waitForRun(resumed.runId);
+      const run = await waitForRunDoc(hostB, resumed.runId, (r) => r.phase === "published");
+      expect(run.finalReview).toContain("Audit notes");
+      expect(jar.fakeGithub.publishedReviews(20)).toHaveLength(1);
+      expect(jar.fakeGithub.state.checks.at(-1)).toMatchObject({ state: "success" });
+    } finally {
+      await hostB.close();
+    }
+  });
+
   it("only one process owns a PR's storage; a second opener is refused", { timeout: 90_000 }, async () => {
     const jar = await openJar({
       pullNumber: 16,
@@ -453,7 +576,7 @@ describe("durable recovery (ticket 06)", () => {
     const hostA = await jar.openHost();
     try {
       // The partition lease is held by host A; the re-open is refused.
-      const lease = jar.service.liveLease("example/scenario", 16);
+      const lease = jar.service.liveLease({ repository: "example/scenario", pullNumber: 16 });
       expect(lease).toBeDefined();
 
       let refusedError: unknown;

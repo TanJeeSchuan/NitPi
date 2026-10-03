@@ -2,6 +2,13 @@
  * Storage service behavior (ticket 06): authentication, partitioning,
  * single-owner leases, durable commits with retried-commit dedup after a
  * lost acknowledgement, and unreachability during an outage.
+ *
+ * These drive the storage service/adapter seam directly, not the review-
+ * host process boundary: the lease/identity/outage properties are the
+ * adapter's own protocol (pi-durable documents the same pattern for custom
+ * backends — the shared conformance suite runs against a Storage
+ * implementation directly). The host-level integration seam is
+ * test/scenario/durable-recovery.test.ts.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
