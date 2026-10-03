@@ -3,10 +3,13 @@
  *
  * - One canonical PR conversation per (repository, pull number). Normal
  *   primary turns run in it; Pi's built-in compaction manages its context.
+ *   Clean runs leave it idle: their primary runs in a fresh task-owned
+ *   conversation and only the completed report is imported into it (ticket
+ *   07), after the final review froze.
  * - Every run gets a fresh re-reviewer conversation.
  * - Run documents record the reviewed subject (repo, PR, base SHA, head SHA),
- *   mode normal, phase, artifact references and check outcome. Markdown stays
- *   the source of truth for findings; run documents are bookkeeping.
+ *   mode normal/clean, phase, artifact references and check outcome. Markdown
+ *   stays the source of truth for findings; run documents are bookkeeping.
  */
 import { TODO_CONTEXT } from "@earendil-works/chord/context";
 import type { Context } from "@earendil-works/chord";
@@ -27,6 +30,7 @@ export type RunPhase =
   | "re-review"
   | "final frozen"
   | "matched"
+  | "imported"
   | "publishing"
   | "published";
 
@@ -48,8 +52,9 @@ export interface RunDocument {
   kind: "nitpi.run";
   version: 1;
   runId: string;
-  /** Mode `normal`; `/review clean` is ticket 07. */
-  mode: "normal";
+  /** `normal` shares the canonical PR conversation; `clean` keeps it idle
+   *  until the completed report is imported (ticket 07). */
+  mode: "normal" | "clean";
   phase: RunPhase;
   subject: {
     repository: string;
@@ -61,6 +66,9 @@ export interface RunDocument {
   pipelineTaskId: string;
   /** Conversation of the canonical PR history this run continues. */
   canonicalConversationId: string;
+  /** Clean runs only: the fresh task-owned conversation the primary turn
+   *  ran in. Normal runs review in the canonical conversation (unset). */
+  primaryConversationId?: string;
   /** Frozen primary artifact, stored verbatim once primary review completes. */
   artifact?: string;
   artifactFrozen: boolean;
@@ -82,6 +90,11 @@ export interface RunDocument {
   /** Model-supplied IDs rejected at publication, with reasons (ticket 04:
    * rejected with a reason and not acted on). */
   matchRejections?: MatchRejection[];
+  /** Import marker (ticket 07): set in the SAME transaction that appended the
+   *  completed report to the canonical PR conversation. Re-entry after a
+   *  crash between that commit and the pipeline's next durable step reads it
+   *  and imports nothing — the report is appended once per run. */
+  imported?: { entryId: string };
   /** The instructions each stage actually used, by content hash. */
   instructionHashes?: { primary?: string; reReview?: string };
   /** Pinned revision the repository instructions were captured at. */

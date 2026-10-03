@@ -35,14 +35,19 @@ import {
 
 export interface ReviewHost {
   /**
-   * Trigger gate entry: a writer's `/review`. Resolves the pull request,
-   * checks eligibility, and starts exactly one durable run for the current
-   * head. Rejects with a reason when the request is refused.
+   * Trigger gate entry: a writer's `/review` — or `/review clean` (ticket
+   * 07). Resolves the pull request, checks eligibility, and starts exactly
+   * one durable run for the current head. Rejects with a reason when the
+   * request is refused.
    */
   handleReviewCommand(command: {
     repository: string;
     pullNumber: number;
     requester: string;
+    /** The command text; the default is `/review`. `/review clean` starts a
+     * run in mode `clean`, which reviews from fresh task-owned
+     * conversations and imports only its completed report once frozen. */
+    commandText?: string;
   }): Promise<{ runId: string; refused?: string; conversationId: string }>;
   /** Resolves when the run's durable task reaches a terminal state. */
   waitForRun(runId: string): Promise<void>;
@@ -128,8 +133,17 @@ class ReviewHostImpl implements ReviewHost {
     repository: string;
     pullNumber: number;
     requester: string;
+    commandText?: string;
   }): Promise<{ runId: string; refused?: string; conversationId: string }> {
     const context = TODO_CONTEXT;
+    const parsed = parseReviewCommand(command.commandText ?? "/review");
+    if (!parsed) {
+      return {
+        runId: "",
+        refused: `unknown review command: ${command.commandText} (expected /review or /review clean)`,
+        conversationId: "",
+      };
+    }
     // Same repository: the host is configured for exactly one repository.
     if (command.repository !== this.config.repository) {
       return { runId: "", refused: `reviewer is not configured for ${command.repository}`, conversationId: "" };
@@ -199,18 +213,21 @@ class ReviewHostImpl implements ReviewHost {
     }
 
     const runId = `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-    const request = toRunRequest(subject);
+    const request = toRunRequest(subject, parsed.commandText);
     const started = await this.harness.commit(async (tx) => {
       const taskId = await tx.createTask(
         reviewTask,
         { runId, canonicalConversationId: canonicalId!, request },
+        // Task ownership sits on the canonical conversation in both modes:
+        // it is host machinery. A clean run's REVIEWER conversations are the
+        // fresh task-owned ones created inside the pipeline (review-task).
         { ownership: { kind: "conversation" }, conversationId: canonicalId as never },
       );
       const run: RunDocument = {
         kind: "nitpi.run",
         version: 1,
         runId,
-        mode: "normal",
+        mode: parsed.mode,
         phase: "primary",
         subject,
         pipelineTaskId: taskId as unknown as string,
@@ -262,14 +279,23 @@ class ReviewHostImpl implements ReviewHost {
   }
 }
 
-function toRunRequest(subject: RunDocument["subject"]): ReviewRunRequest {
+function toRunRequest(subject: RunDocument["subject"], commandText: string): ReviewRunRequest {
   return {
     repository: subject.repository,
     pullNumber: subject.pullNumber,
     baseSha: subject.baseSha,
     headSha: subject.headSha,
-    command: "/review",
+    command: commandText as ReviewRunRequest["command"],
   };
+}
+
+/** `/review` → mode normal; `/review clean` → mode clean (ticket 07). Any
+ * other spelling is refused before any GitHub call. */
+function parseReviewCommand(text: string): { mode: "normal" | "clean"; commandText: string } | undefined {
+  const normalized = text.trim().replace(/\s+/g, " ").toLowerCase();
+  if (normalized === "/review") return { mode: "normal", commandText: "/review" };
+  if (normalized === "/review clean") return { mode: "clean", commandText: "/review clean" };
+  return undefined;
 }
 
 function nodeEnv(cwd: string) {

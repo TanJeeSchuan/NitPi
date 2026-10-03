@@ -12,6 +12,10 @@
  * Ticket 01 assumed every inline anchor is valid; ticket 02 adds validation
  * (anchor-validation.ts). A labeled finding section without an inline
  * location is a parse error, not a silent drop.
+ *
+ * Ticket 07 reuses the audit split here: the imported report (ticket 07)
+ * strips the audit-notes section — private conversations, tool output and
+ * audit notes are not imported into the shared PR history.
  */
 export type DiffSide = "LEFT" | "RIGHT";
 
@@ -60,6 +64,13 @@ export function parseFinalReview(markdown: string): ParsedReview {
     if (parsed) findings.push(parsed);
   }
   return { findings, auditNotes: audit };
+}
+
+/** The final review minus its audit-notes section (ticket 07): the text a
+ * clean run imports into the canonical PR conversation. Reviews without audit
+ * notes pass through unchanged. */
+export function stripAuditNotes(markdown: string): string {
+  return splitAudit(markdown.replace(/\r\n/g, "\n")).review;
 }
 
 function splitAudit(markdown: string): { review: string; audit: string } {

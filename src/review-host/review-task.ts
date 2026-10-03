@@ -5,14 +5,19 @@
  *   primary → freeze artifact → re-review → final frozen → publish → published
  *
  * Instructions per stage come from the resolved protocol + policy + repository
- * layers (instructions.ts). The primary turn runs in the canonical PR
- * conversation; the re-reviewer runs in a fresh task-owned conversation
+ * layers (instructions.ts). A normal run's primary turn runs in the canonical
+ * PR conversation; the re-reviewer runs in a fresh task-owned conversation
  * created by this task with explicit agent configuration, on its own unchanged
- * checkout. It receives the frozen artifact plus repository and PR inputs —
- * never the primary transcript. After the final review is frozen, one more
- * matching-only turn in that same conversation assigns current findings to
- * earlier published comment IDs (ticket 04); the publisher then keeps the
- * pull request's threads in sync.
+ * checkout. A clean run (ticket 07) reviews in fresh task-owned conversations
+ * for BOTH stages: until the final review freezes, neither reviewer may
+ * receive earlier transcripts, artifacts, findings or discussion — the
+ * canonical PR conversation stays idle, and no GitHub read would return
+ * earlier bot comments. After the final review is frozen, one more
+ * matching-only turn in the re-reviewer conversation assigns current findings
+ * to earlier published comment IDs (ticket 04). A clean run's completed report
+ * is then imported into the idle canonical conversation — the import and its
+ * marker in one transaction — before publication (ticket 07); the publisher
+ * then keeps the pull request's threads in sync.
  *
  * Module dependencies (`installReviewTaskDeps`) exist because pi-durable
  * resolves task definitions from the registry at invocation: the process-wide
@@ -21,11 +26,16 @@
 import type { Context } from "@earendil-works/chord";
 import { TODO_CONTEXT } from "@earendil-works/chord/context";
 import { createHash } from "node:crypto";
-import type { Conversation, Harness } from "@earendil-works/pi-durable";
-import { defineTask } from "@earendil-works/pi-durable";
+import type { UserMessage } from "@earendil-works/pi-ai";
+import type {
+  Conversation,
+  Harness,
+  TaskRuntime,
+} from "@earendil-works/pi-durable";
+import { defineEntry, defineTask } from "@earendil-works/pi-durable";
 import { Publisher, PublishError } from "../github/publisher.js";
 import type { GitHubApi } from "../github/publisher.js";
-import { parseFinalReview } from "./artifact.js";
+import { parseFinalReview, stripAuditNotes } from "./artifact.js";
 import {
   parseUnifiedDiffAnchors,
   validateFindingAnchors,
@@ -46,9 +56,14 @@ export interface ReviewRunRequest {
   readonly pullNumber: number;
   readonly baseSha: string;
   readonly headSha: string;
-  /** `/review` only in ticket 01 (`clean` is ticket 07, `cancel` ticket 09). */
-  readonly command: "/review";
+  /** `/review` or `/review clean` (`cancel` is ticket 09). */
+  readonly command: string;
 }
+
+/** Imported report entry (ticket 07): one clean run's completed review in the
+ * canonical PR conversation. The `model` payload is the user message the next
+ * normal run sees; audit notes are not imported. */
+export const ImportedReportEntry = defineEntry<{ runId: string }>("nitpi.imported-report");
 
 /** Process-wide host wiring consumed by task phases. */
 export interface ReviewTaskDeps {
@@ -76,7 +91,7 @@ export interface ReviewTaskInput {
 }
 
 export interface ReviewCheckpoint {
-  phase: "primary" | "re-review" | "match" | "publish";
+  phase: "primary" | "re-review" | "match" | "import" | "publish";
 }
 
 export type ReviewTaskResult =
@@ -93,13 +108,26 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
         const host = reviewTaskDeps();
         const runDoc = await host.runHistory.findRun(task.input.runId, context);
         if (!runDoc) throw new Error(`run ${task.input.runId} is not recorded`);
-        const canonical = await harnessConversation(host.runHistory.harness, task.input.canonicalConversationId);
+
+        // Where the primary reviews: a normal run continues the canonical PR
+        // conversation; a clean run (ticket 07) opens a fresh task-owned
+        // conversation instead — never a fork of the canonical one, and the
+        // canonical conversation stays idle until the report is imported.
+        let primary = await harnessConversation(host.runHistory.harness, task.input.canonicalConversationId);
+        if (runDoc.mode === "clean") {
+          const fresh = await freshTaskOwnedConversation(runtime, context);
+          await commitRunUpdate(host, task.input.runId, context, (run) => ({
+            ...run,
+            primaryConversationId: fresh.id as unknown as string,
+          }));
+          primary = fresh;
+        }
 
         // Primary instructions: protocol + policy + repository layers, with
         // the content hash recorded on the run document.
         const instructions = host.getInstructions("primary");
         await configureConversation(
-          canonical,
+          primary,
           "nitpi-primary",
           host.config.primary.modelId,
           instructions.text,
@@ -118,10 +146,10 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
 
         // Primary turn: one prompt, run to completion, Pi keeps the tool loop.
         const prompt = buildPrimaryPrompt(runDoc);
-        await runConversationTurn(canonical, prompt, context);
+        await runConversationTurn(primary, prompt, context);
 
         // Freeze the hand-off: stored unchanged as free-form text.
-        const answer = await latestAssistant(canonical, context);
+        const answer = await latestAssistant(primary, context);
         const artifact = answer?.text ?? "";
         await commitRunUpdate(host, task.input.runId, context, (run) => ({
           ...run,
@@ -301,10 +329,14 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
           ...(usage !== undefined ? { usage } : {}),
         }));
 
+        // Clean runs (ticket 07) import their completed report before
+        // publication; normal runs review in the canonical conversation and
+        // have nothing to import.
+        const nextPhase: ReviewCheckpoint["phase"] = runDoc.mode === "clean" ? "import" : "publish";
         await runtime.commit(
           (_tx, current) => ({
             status: "running" as const,
-            checkpoint: { ...current.state.checkpoint, phase: "publish" as const },
+            checkpoint: { ...current.state.checkpoint, phase: nextPhase },
           }),
           context,
         );
@@ -361,6 +393,36 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
             }) as const,
           context,
         );
+      }
+    },
+
+    /** Clean-run import (ticket 07): the completed report joins the shared PR
+     * history once, in one transaction, before publication — even when
+     * publication later fails. The append and the run's import marker are
+     * committed together; a re-entry (a crash between this commit and the
+     * next durable step) finds the marker and imports nothing. Failed or
+     * cancelled clean runs never reach this phase: failures before the final
+     * review froze fault the run earlier, and the abort handler imports
+     * nothing.
+     */
+    import: async (task, runtime, context) => {
+      try {
+        const host = reviewTaskDeps();
+        const runDoc = await host.runHistory.findRun(task.input.runId, context);
+        if (!runDoc) throw new Error(`run ${task.input.runId} is not recorded`);
+        if (runDoc.mode !== "clean") throw new Error("only clean runs import their report");
+        if (!runDoc.finalReview) throw new Error("final review is not frozen");
+        await commitImportedReport(host.runHistory, task.input.runId, context);
+
+        await runtime.commit(
+          (_tx, current) => ({
+            status: "running" as const,
+            checkpoint: { ...current.state.checkpoint, phase: "publish" as const },
+          }),
+          context,
+        );
+      } catch (error) {
+        await failRun(task.input.runId, context, error);
       }
     },
   },
@@ -559,7 +621,72 @@ function buildAnchorFeedbackPrompt(invalid: readonly InvalidAnchor[]): string {
   ].join("\n");
 }
 
+/**
+ * Clean-run import (ticket 07): append the run's completed report to the
+ * canonical PR conversation and set the run's import marker — in ONE
+ * transaction. The imported entry is a user message so the next normal run's
+ * model context sees the report; private conversations, tool output and audit
+ * notes are not imported. A run whose marker is already set (the re-entry a
+ * crash between the import commit and the next durable step takes) appends
+ * nothing: every run imports its report once, even when publication later
+ * fails. Normal runs import nothing (their primary already runs in the
+ * canonical conversation).
+ */
+export async function commitImportedReport(
+  history: RunHistory,
+  runId: string,
+  context: Context,
+): Promise<{ imported: boolean; entryId?: string }> {
+  let result: { imported: boolean; entryId?: string } | undefined;
+  await history.harness.commit(async (tx) => {
+    const run = await history.findRunInTx(tx, runId);
+    if (!run) throw new Error(`run ${runId} missing while importing`);
+    if (run.mode !== "clean") {
+      result = { imported: false };
+      return;
+    }
+    if (!run.finalReview) throw new Error("a clean run cannot import without a frozen final review");
+    if (run.imported) {
+      result = { imported: false, entryId: run.imported.entryId };
+      return;
+    }
+    const report = stripAuditNotes(run.finalReview);
+    const entry = await tx.appendEntry(ImportedReportEntry, run.canonicalConversationId as never, {
+      data: { runId },
+      model: [
+        {
+          role: "user",
+          content: report,
+          timestamp: Date.now(),
+        } satisfies UserMessage,
+      ],
+    });
+    const entryId = entry.id as unknown as string;
+    // Same transaction: the append and the marker commit together.
+    await history.record(tx, { ...run, imported: { entryId }, phase: "imported" });
+    result = { imported: true, entryId };
+  }, context);
+  return result!;
+}
+
 export const __testing = { buildPrimaryPrompt, buildReReviewPrompt, buildAnchorFeedbackPrompt };
+
+/** Fresh task-owned conversation for one clean-run stage (ticket 07): a real
+ * conversation, never a fork of the canonical PR conversation. */
+async function freshTaskOwnedConversation(
+  runtime: TaskRuntime<ReviewTaskInput, ReviewCheckpoint, ReviewTaskResult, object>,
+  context: Context,
+): Promise<Conversation> {
+  let createdId: string | undefined;
+  await runtime.commit(async (tx) => {
+    const record = await tx.createConversation({
+      ownership: { kind: "task", taskId: runtime.taskId },
+    });
+    createdId = record.id as unknown as string;
+  }, context);
+  if (!createdId) throw new Error("task-owned conversation was not created");
+  return harnessConversation(reviewTaskDeps().runHistory.harness, createdId);
+}
 
 /** Read the pull request's base→head diff (the pinned diff), as GitHub serves it. */
 async function readPinnedDiff(
