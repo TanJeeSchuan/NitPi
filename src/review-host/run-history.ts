@@ -33,7 +33,11 @@ export type RunPhase =
   | "matched"
   | "imported"
   | "publishing"
-  | "published";
+  | "published"
+  /** Terminal (ticket 08): the run completed its review, but the pull
+   *  request's head moved on or the pull request is no longer open before
+   *  publication. History only: nothing is posted to GitHub. */
+  | "GitHub skipped";
 
 /** Token usage of one settling assistant message. */
 export interface StageUsage {

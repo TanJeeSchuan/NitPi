@@ -58,3 +58,11 @@ Only its generated report is contributed to the ongoing PR conversation.
 **Shared PR history**:
 The ongoing durable conversation for one pull request, which normal reviews continue.
 _Avoid_: GitHub comment history, operational log
+
+**Pending request**:
+The one request a pull request holds while a review is active; it keeps only the newest eligible requested head and its mode, and starts after eligibility is re-checked when the active run ends.
+_Avoid_: retry queue, backlog of requests
+
+**Stale run**:
+A run that finished after the pull request's head moved on or the pull request stopped being open. It is kept in history attributed to the head it reviewed and publishes nothing.
+_Avoid_: outdated review, lost review

@@ -55,12 +55,21 @@
  * all live here — they are one durable phase-advance behavior, not unrelated
  * reasons (the code-review question is answered by the phase boundaries
  * each concern sits behind).
+ *
+ * Ticket 08: before publication the run re-reads the pull request. A run
+ * whose head is no longer the pull request's head, or whose pull request is
+ * no longer open, keeps its completed final review in history attributed to
+ * its own head, posts nothing to GitHub (no review, comments, thread
+ * changes or check runs), resolves no threads, and ends as "GitHub
+ * skipped" — never as a success for the newer head. The check runs in the
+ * match phase (before the matching turn and its bookkeeping) and again in
+ * the publish phase, so a push landing between the two is still caught.
  */
 import type { Context } from "@earendil-works/chord";
 import { TODO_CONTEXT } from "@earendil-works/chord/context";
 import { createHash } from "node:crypto";
 import type { UserMessage } from "@earendil-works/pi-ai";
-import type { Conversation, Harness, Submission, TaskRuntime } from "@earendil-works/pi-durable";
+import type { Conversation, Harness, RunningTask, Submission, TaskRuntime } from "@earendil-works/pi-durable";
 import { defineEntry, defineTask } from "@earendil-works/pi-durable";
 import { Publisher, PublishError } from "../github/publisher.js";
 import type { GitHubApi } from "../github/publisher.js";
@@ -359,6 +368,21 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
         const host = reviewTaskDeps();
         const runDoc = await host.runHistory.findRun(task.input.runId, context);
         if (!runDoc?.finalReview) throw new Error("final review is not frozen");
+        // Ticket 08: a run whose pull request moved on while it reviewed
+        // keeps its frozen review in history and publishes nothing — skip
+        // the matching turn (publication preparation) entirely. A stale clean
+        // run still imports its completed report first (ticket 07: a
+        // completed clean report always joins the shared PR history); the
+        // publish-phase fence then skips publication.
+        const stale = await publicationStaleness(host, runDoc);
+        if (stale) {
+          if (runDoc.mode === "clean") {
+            await advancePhase(runtime, context, "import");
+            return;
+          }
+          await finishStaleSkip(host, task, runtime, context, stale);
+          return;
+        }
         const publisher = new Publisher(host.api);
         await publisher.checkInProgress(runDoc.subject, "matching");
 
@@ -421,6 +445,13 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
       const host = reviewTaskDeps();
       const runDoc = await host.runHistory.findRun(task.input.runId, context);
       if (!runDoc?.finalReview) throw new Error("final review is not frozen");
+      // Ticket 08: re-check before any publish-phase write — a push (or a
+      // close) landing between the match-phase check and here is caught now.
+      const stale = await publicationStaleness(host, runDoc);
+      if (stale) {
+        await finishStaleSkip(host, task, runtime, context, stale);
+        return;
+      }
       const publisher = new Publisher(host.api);
       const subject = runDoc.subject;
 
@@ -538,6 +569,68 @@ async function advancePhase(
       status: "running" as const,
       checkpoint: { ...current.state.checkpoint, phase },
     }),
+    context,
+  );
+}
+
+/**
+ * Publication eligibility (ticket 08): the reviewed head must still be the
+ * pull request's head and the pull request must still be open. Returns the
+ * reason the completed review must stay unpublished, or undefined when the
+ * run may publish. An unreadable pull request is NOT staleness — it fails
+ * the run through the caller's normal error path instead of guessing.
+ */
+async function publicationStaleness(
+  host: ReviewTaskDeps,
+  run: RunDocument,
+): Promise<string | undefined> {
+  const response = await host.api.getPullRequest(run.subject.repository, run.subject.pullNumber);
+  if (response.status !== 200) {
+    throw new PublishError(
+      `cannot read the pull request before publishing (HTTP ${response.status})`,
+    );
+  }
+  const body = response.body as { state?: string; head?: { sha?: string } };
+  if (body.state !== "open") {
+    return `superseded: the pull request is ${body.state ?? "closed"}; the completed review is kept in history and nothing was published`;
+  }
+  const headSha = body.head?.sha ?? "";
+  if (!/^[0-9a-f]{40}$/i.test(headSha) || headSha !== run.subject.headSha) {
+    const movedTo = /^[0-9a-f]{40}$/i.test(headSha) ? headSha.slice(0, 12) : "an unknown commit";
+    return `superseded: the pull request's head moved to ${movedTo} while this review was running on ${run.subject.headSha.slice(0, 12)}; the completed review is kept in history and nothing was published`;
+  }
+  return undefined;
+}
+
+/** The run task's runtime, for the shared stale fence below. */
+type ReviewRuntime = TaskRuntime<ReviewTaskInput, ReviewCheckpoint, ReviewTaskResult, object>;
+
+/** Shared stale fence (ticket 08): mark the run "GitHub skipped" — the
+ * frozen review stays in history attributed to the run's own head — and
+ * complete the task without publishing. No GitHub writes happen: no check
+ * runs, reviews, comments or thread changes. */
+async function finishStaleSkip(
+  host: ReviewTaskDeps,
+  task: RunningTask<ReviewTaskInput, ReviewCheckpoint, ReviewTaskResult>,
+  runtime: ReviewRuntime,
+  context: Context,
+  reason: string,
+): Promise<void> {
+  await commitRunUpdate(host, task.input.runId, context, (run) => ({
+    ...run,
+    phase: "GitHub skipped" as const,
+    checkStatus: "skipped" as const,
+    checkDetail: reason,
+  }));
+  await runtime.commit(
+    (_tx) =>
+      ({
+        status: "terminal" as const,
+        outcome: {
+          status: "completed" as const,
+          result: { published: false as const, reason },
+        },
+      }) as const,
     context,
   );
 }

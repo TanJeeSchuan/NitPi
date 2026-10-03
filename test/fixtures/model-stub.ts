@@ -21,6 +21,9 @@ export interface StubTurn {
   /** finish_reason of the final chunk; inferred: tool call → tool_calls, else stop. */
   finishReason?: "stop" | "tool_calls";
   usage?: { promptTokens?: number; completionTokens?: number };
+  /** Hold the response open this long before streaming — lets a test land
+   * a concurrent trigger deterministically inside this turn. */
+  delayMs?: number;
 }
 
 export interface StubError {
@@ -125,6 +128,7 @@ export class ModelStub {
       response.flushHeaders();
       return;
     }
+    if (step.delayMs) await new Promise((resolve) => setTimeout(resolve, step.delayMs));
     this.streamTurn(step, response);
   }
 
