@@ -306,8 +306,13 @@ describe("scenario: fork pull requests", () => {
         const runs = await runsOf(stage.host);
         expect(runs).toHaveLength(2);
         expect(runs.map((r) => r.subject.headSha)).toEqual([repo.headSha, pushedSha]);
-        expect(stage.fake.publishedReviews(7)).toHaveLength(2);
-        expect(stage.fake.publishedReviews(7)[1]!.commitId).toBe(pushedSha);
+        // Ticket 04's maintained summary: the rerun publishes by PATCHing the
+        // bot's summary review, not by adding another one — its body shows the
+        // new run's reviewed head and its zero finding count.
+        expect(stage.fake.publishedReviews(7)).toHaveLength(1);
+        expect(stage.fake.publishedReviews(7)[0]!.body).toContain(`\`${pushedSha}\``);
+        expect(stage.fake.publishedReviews(7)[0]!.body).toContain("0 findings");
+        expect(runs[1]!.publication?.reviewId).toBe(stage.fake.publishedReviews(7)[0]!.id);
       },
     );
   });
@@ -669,7 +674,12 @@ describe("scenario: pending requests and named checks", () => {
         });
         expect(replay.outcome).toBe("duplicate");
         expect(await runsOf(stage.host)).toHaveLength(2);
-        expect(stage.fake.publishedReviews(7)).toHaveLength(2);
+        // The queued run publishes under ticket 04's maintained-summary model:
+        // one summary review, PATCHed to show the queued run's head.
+        const pushes = await runsOf(stage.host);
+        expect(pushes[1]!.publication?.reviewId).toBeTruthy();
+        expect(stage.fake.publishedReviews(7)).toHaveLength(1);
+        expect(stage.fake.publishedReviews(7)[0]!.body).toContain(`\`${pushed}\``);
       },
     );
   });

@@ -190,18 +190,23 @@ export const prKey = (repository: string, pullNumber: number): string => `${repo
 
 /**
  * Dedup identity of a delivered trigger. An explicit workflow delivery id
- * (GitHub's delivery GUID) decides alone — that is the production contract
- * (ticket 11 wiring supplies it); without one the composite fallback can
- * conflate distinct triggers that coincide on requester/action/head, so
- * `deliveryKey` should always be supplied in the workflow.
+ * (GitHub's delivery GUID) decides alone and enables redelivery dedup —
+ * that is the production contract (ticket 11 wiring supplies it). Without
+ * one the trigger is a DISTINCT delivery: each call gets a unique key, so a
+ * repeated `/review` on an already-reviewed head starts a new run (spec
+ * user story 4) and only workflow-supplied ids deduplicate (AC 5).
  */
+let distinctDeliverySeq = 0;
+
 export function eventKeyOf(event: TriggerEvent, headSha?: string): string {
   const pr = prKey(event.repository, event.pullNumber);
   if (event.deliveryKey) return `${pr}:delivery:${event.deliveryKey}`;
+  distinctDeliverySeq += 1;
+  const prTag = `${pr}#${distinctDeliverySeq.toString(36)}`;
   if (event.kind === "comment") {
-    return `${pr}:comment:${event.requester}:${event.command}${headSha ? `@${headSha}` : ""}`;
+    return `${prTag}:comment:${event.requester}:${event.command}${headSha ? `@${headSha}` : ""}`;
   }
-  return `${pr}:${event.action}:${event.sender}:${headSha ?? "head"}`;
+  return `${prTag}:${event.action}:${event.sender}:${headSha ?? "head"}`;
 }
 
 /** The automatic preset: all four events, no check wait. */

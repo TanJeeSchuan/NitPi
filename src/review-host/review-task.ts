@@ -9,7 +9,10 @@
  * conversation; the re-reviewer runs in a fresh task-owned conversation
  * created by this task with explicit agent configuration, on its own unchanged
  * checkout. It receives the frozen artifact plus repository and PR inputs —
- * never the primary transcript.
+ * never the primary transcript. After the final review is frozen, one more
+ * matching-only turn in that same conversation assigns current findings to
+ * earlier published comment IDs (ticket 04); the publisher then keeps the
+ * pull request's threads in sync.
  *
  * Module dependencies (`installReviewTaskDeps`) exist because pi-durable
  * resolves task definitions from the registry at invocation: the process-wide
@@ -26,12 +29,17 @@ import { parseFinalReview } from "./artifact.js";
 import {
   parseUnifiedDiffAnchors,
   validateFindingAnchors,
-  type DiffAnchors,
   type InvalidAnchor,
 } from "./anchor-validation.js";
+import {
+  buildMatchPrompt,
+  matchableComments,
+  parseMatchList,
+  type FindingMatch,
+} from "./matching.js";
 import type { ReviewHostConfig } from "./config.js";
 import type { ResolvedInstructions } from "./instructions.js";
-import type { RunDocument, RunHistory, RunPhase } from "./run-history.js";
+import type { RunDocument, RunHistory, RunPhase, StageUsage } from "./run-history.js";
 
 export interface ReviewRunRequest {
   readonly repository: string;
@@ -72,7 +80,7 @@ export interface ReviewTaskInput {
 }
 
 export interface ReviewCheckpoint {
-  phase: "primary" | "re-review" | "publish";
+  phase: "primary" | "re-review" | "match" | "publish";
 }
 
 export type ReviewTaskResult =
@@ -237,6 +245,69 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
         await runtime.commit(
           (_tx, current) => ({
             status: "running" as const,
+            checkpoint: { ...current.state.checkpoint, phase: "match" as const },
+          }),
+          context,
+        );
+      } catch (error) {
+        await failRun(task.input.runId, context, error);
+      }
+    },
+
+    match: async (task, runtime, context) => {
+      try {
+        const host = reviewTaskDeps();
+        const runDoc = await host.runHistory.findRun(task.input.runId, context);
+        if (!runDoc?.finalReview) throw new Error("final review is not frozen");
+        const publisher = new Publisher(host.api);
+        await publisher.checkInProgress(runDoc.subject, "matching");
+
+        // Earlier published findings and their comment IDs, read once: this
+        // is the snapshot the matching turn sees and the same snapshot the
+        // publisher validates model-supplied IDs against.
+        const earlier = await publisher.listPublishedComments(runDoc.subject);
+        const findings = runDoc.findings ?? [];
+        const matches: FindingMatch[] = [];
+        let matchUsage: StageUsage | undefined;
+        if (earlier.length > 0 && findings.length > 0) {
+          // A zero-finding rerun needs no matching turn: the publisher
+          // resolves every omitted bot thread at publish time. This turn
+          // runs only when there are findings to assign and something to
+          // assign them to.
+          // One more turn in the SAME re-reviewer conversation; matching
+          // only — it cannot change the frozen findings.
+          if (!runDoc.reReviewConversationId) {
+            throw new Error("re-reviewer conversation is not recorded");
+          }
+          const conversation = await harnessConversation(host.runHistory.harness, runDoc.reReviewConversationId);
+          const botLogin = await publisher.botLogin();
+          // Only live bot thread roots are matchable: replies and comments
+          // the publisher already marked superseded are out of the pool.
+          await runConversationTurn(
+            conversation,
+            buildMatchPrompt(findings, matchableComments(earlier, botLogin)),
+            context,
+          );
+          const answer = await latestAssistant(conversation, context);
+          matches.push(...parseMatchList(answer?.text ?? "", new Set(findings.map((f) => f.label))).matches);
+          matchUsage = answer?.usageSummary;
+        }
+
+        // Durable commits carry strict JSON: include the matching-turn usage
+        // only when the turn ran (it is skipped on first runs and
+        // zero-finding reviews).
+        const usage = matchUsage ? { ...runDoc.usage, matching: matchUsage } : runDoc.usage;
+        await commitRunUpdate(host, task.input.runId, context, (run) => ({
+          ...run,
+          earlierComments: earlier,
+          matches,
+          phase: "matched",
+          ...(usage !== undefined ? { usage } : {}),
+        }));
+
+        await runtime.commit(
+          (_tx, current) => ({
+            status: "running" as const,
             checkpoint: { ...current.state.checkpoint, phase: "publish" as const },
           }),
           context,
@@ -259,11 +330,14 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
           runDoc,
           runDoc.finalReview,
           runDoc.findings ?? [],
+          runDoc.earlierComments ?? [],
+          runDoc.matches ?? [],
           context.abortSignal,
         );
         await commitRunUpdate(host, task.input.runId, context, (run) => ({
           ...run,
           publication: { reviewId: published.reviewId, commentIds: published.commentIds },
+          matchRejections: published.rejections,
           phase: "published",
           checkStatus: "success",
           checkDetail: `published review ${published.reviewId} with ${run.findings?.length ?? 0} finding(s)`,
@@ -397,12 +471,12 @@ export interface TurnAnswer {
   usageSummary: { input: number; output: number; totalTokens: number };
 }
 
-/**
- * Newest assistant entry with text, scanning newest-first. Entries arrive
- * newest-first; the first assistant entry carrying text is the answer. The
- * correction round (ticket 02) relies on this: the resubmitted final review
- * is the newest assistant text, not an earlier turn's.
- */
+/** The newest assistant entry with text; return the first hit found of the
+ * newest-first page. Tool-only assistant messages (no text) are skipped, so
+ * the loop keeps walking past them to the newest turn that actually answered.
+ * The correction and matching turns depend on this: the resubmitted final
+ * review (ticket 02) and the match list (ticket 04) are the newest assistant
+ * text, not an earlier turn's. */
 async function latestAssistant(conversation: Conversation, context: Context): Promise<TurnAnswer | undefined> {
   const page = await conversation.entries({ conversationId: conversation.id } as never, 20, undefined, context);
   for (const entry of page.items) {
