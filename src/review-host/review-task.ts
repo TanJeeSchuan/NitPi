@@ -30,8 +30,14 @@ import {
   type InvalidAnchor,
 } from "./anchor-validation.js";
 import type { ReviewHostConfig } from "./config.js";
+import { resolveInstructions } from "./instructions.js";
 import type { ResolvedInstructions } from "./instructions.js";
-import type { RunDocument, RunHistory, RunPhase } from "./run-history.js";
+import type {
+  RunDocument,
+  RunHistory,
+  RunPhase,
+  StageInstructionsRecord,
+} from "./run-history.js";
 
 export interface ReviewRunRequest {
   readonly repository: string;
@@ -47,6 +53,13 @@ export interface ReviewTaskDeps {
   readonly config: ReviewHostConfig;
   readonly runHistory: RunHistory;
   readonly api: GitHubApi;
+  /**
+   * Fallback instruction source, used only for a run that predates stored
+   * instructions (no `resolvedInstructions` on the run document). Runs ticket
+   * 10 stores resolve from the run document instead, so a mid-run
+   * configuration change cannot alter them — and recovery reuses the stored
+   * text even when the configuration changed mid-run.
+   */
   getInstructions(role: "primary" | "re-review"): ResolvedInstructions;
 }
 
@@ -87,9 +100,10 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
         if (!runDoc) throw new Error(`run ${task.input.runId} is not recorded`);
         const canonical = await harnessConversation(host.runHistory.harness, task.input.canonicalConversationId);
 
-        // Primary instructions: protocol + policy + repository layers, with
-        // the content hash recorded on the run document.
-        const instructions = host.getInstructions("primary");
+        // Primary instructions: the run's stored resolution (protocol +
+        // policy + repository layers, plus the custom prompt in append or
+        // replace mode), with the content hash recorded on the run document.
+        const instructions = await instructionsForStage(host, "primary", runDoc, context);
         await configureConversation(
           canonical,
           "nitpi-primary",
@@ -157,7 +171,7 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
           createdId = record.id as unknown as string;
         }, context);
         const conversation = await harnessConversation(host.runHistory.harness, createdId!);
-        const instructions = host.getInstructions("re-review");
+        const instructions = await instructionsForStage(host, "re-review", runDoc, context);
         await configureConversation(
           conversation,
           "nitpi-re-review",
@@ -306,6 +320,38 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
 });
 
 // --- helpers ----------------------------------------------------------------
+
+/**
+ * Ticket 10: the instructions one stage runs with — the run document's stored
+ * resolution when present (every run ticket 10 creates, including recovered
+ * ones), falling back to the host configuration only for a run that predates
+ * stored instructions.
+ */
+async function instructionsForStage(
+  host: ReviewTaskDeps,
+  role: "primary" | "re-review",
+  runDoc: RunDocument,
+  context: Context,
+): Promise<ResolvedInstructions> {
+  const stored = runDoc.resolvedInstructions;
+  const record = role === "primary" ? stored?.primary : stored?.reReview;
+  if (record) return storedInstructionsToResolved(record);
+  return host.getInstructions(role);
+}
+
+/** A stored record is the same shape the resolver produces — validate the mode. */
+function storedInstructionsToResolved(stored: StageInstructionsRecord): ResolvedInstructions {
+  if (stored.promptMode !== "append" && stored.promptMode !== "replace" && stored.promptMode !== "none") {
+    throw new Error(`stored instructions for the stage have an unknown prompt mode: ${String(stored.promptMode)}`);
+  }
+  if (!stored.policyPin) throw new Error("stored instructions are missing the review-policy pin");
+  return {
+    text: stored.text,
+    policyPin: stored.policyPin,
+    promptMode: stored.promptMode,
+    ...(stored.customPrompt !== undefined ? { customPrompt: stored.customPrompt } : {}),
+  };
+}
 
 /** Record a stage failure on the run document and GitHub, then rethrow so the
  * durable task faults with the reason. No provisional findings are published. */

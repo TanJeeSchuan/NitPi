@@ -19,6 +19,7 @@ import {
   type Tx,
 } from "@earendil-works/pi-durable";
 import type { ReviewFinding } from "./artifact.js";
+import type { ResolvedInstructions } from "./instructions.js";
 
 export type RunPhase =
   | "primary"
@@ -31,6 +32,17 @@ export type RunPhase =
 export interface RunUsage {
   primary?: { input: number; output: number; totalTokens: number };
   reReview?: { input: number; output: number; totalTokens: number };
+}
+
+/** One stage's resolved instructions as stored on the run document (ticket 10). */
+export interface StageInstructionsRecord {
+  /** The full resolved instruction block the stage ran with. */
+  text: string;
+  readonly policyPin?: string;
+  /** How the custom prompt was applied: `append`, `replace`, or none. */
+  promptMode: "append" | "replace" | "none";
+  /** The custom prompt text resolved into the instructions, when any. */
+  customPrompt?: string;
 }
 
 export interface RunDocument {
@@ -65,6 +77,16 @@ export interface RunDocument {
   publication?: { reviewId: number; commentIds: number[] };
   /** The instructions each stage actually used, by content hash. */
   instructionHashes?: { primary?: string; reReview?: string };
+  /**
+   * The instructions each stage actually used, resolved once at run start
+   * (ticket 10). Recovery reuses these even when the configuration changed
+   * mid-run. `promptMode` distinguishes default policy runs (`none`) from
+   * append/replace runs.
+   */
+  resolvedInstructions?: {
+    primary?: StageInstructionsRecord;
+    reReview?: StageInstructionsRecord;
+  };
   /** Pinned revision the repository instructions were captured at. */
   repositoryInstructionsRevision?: string;
   /** Per-stage unchanged checkouts of the reviewed head. */
@@ -124,6 +146,20 @@ export class RunHistory {
       (r) => r.subject.repository === repository && r.subject.pullNumber === pullNumber,
     );
     return run?.canonicalConversationId;
+  }
+
+  /**
+   * The stored instructions a stage of one run actually used (ticket 10).
+   * Recovery reads from the run document, not the live configuration, so a
+   * mid-run configuration change cannot alter an in-progress run.
+   */
+  async instructionsFor(
+    runId: string,
+    role: "primary" | "re-review",
+    context: Context,
+  ): Promise<StageInstructionsRecord | undefined> {
+    const run = await this.findRun(runId, context);
+    return role === "primary" ? run?.resolvedInstructions?.primary : run?.resolvedInstructions?.reReview;
   }
 
   async createCanonicalConversation(

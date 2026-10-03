@@ -6,3 +6,5 @@ coverage/
 *.sqlite-wal
 *.sqlite-shm
 .nitpi-cache/
+.vitest/
+verbose.log

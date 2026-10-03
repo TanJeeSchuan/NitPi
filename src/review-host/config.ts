@@ -4,7 +4,9 @@
  * GitHub secrets carry credentials. Inputs arrive already resolved by the
  * trusted main-branch workflow.
  *
- * Custom prompts per stage are ticket 10 and intentionally absent here.
+ * Custom prompts per stage (ticket 10) arrive here the same way: per-stage
+ * `customPrompt` with `append` or `replace` mode. They are trusted policy from
+ * the main-branch workflow; PR content can never supply them.
  *
  * An endpoint that lacks streaming or tool-call support fails with an explicit
  * configuration error before any model call — there is no fallback model.
@@ -17,6 +19,13 @@ export function isFullSha(value: unknown): value is string {
 }
 
 /** One stage's resolved configuration. */
+export interface CustomPrompt {
+  /** The prompt text. Empty replace text is rejected by `resolveConfig`. */
+  readonly text: string;
+  /** `append` adds the prompt below the built-in policy; `replace` swaps it in. */
+  readonly mode: "append" | "replace";
+}
+
 export interface StageInput {
   /** Base URL of the stage's OpenAI-compatible endpoint. */
   readonly baseUrl: string;
@@ -26,6 +35,11 @@ export interface StageInput {
   readonly apiKey: string;
   /** Optional provider options merged into the model request. */
   readonly providerOptions?: Record<string, unknown>;
+  /**
+   * Optional repository-owner prompt for this stage (ticket 10). With no
+   * prompt, the stage's instructions use the built-in review policy.
+   */
+  readonly customPrompt?: CustomPrompt | undefined;
 }
 
 export interface ReviewHostConfig {
@@ -69,6 +83,42 @@ function requireStage(stage: string, input: StageInput | undefined): StageInput 
   return input;
 }
 
+/**
+ * Validate one stage's custom prompt (ticket 10). Structural errors are
+ * configuration errors so they fail before anything runs; `replace` mode with
+ * an empty prompt is rejected so no stage is ever left without a review
+ * policy.
+ */
+export function validateCustomPrompt(stage: string, prompt: CustomPrompt | undefined): void {
+  if (!prompt) return;
+  if (typeof prompt.text !== "string") {
+    throw new ConfigError(`${stage} customPrompt.text must be a string`);
+  }
+  if (prompt.mode !== "append" && prompt.mode !== "replace") {
+    throw new ConfigError(
+      `${stage} customPrompt.mode must be "append" or "replace", got ${JSON.stringify(prompt.mode)}`,
+    );
+  }
+  if (prompt.mode === "replace" && !prompt.text.trim()) {
+    throw new ConfigError(
+      `${stage} replace mode requires a non-empty custom prompt (a stage without a review policy is not reviewable)`,
+    );
+  }
+}
+
+/**
+ * The custom-prompt policy for one stage after validation: `undefined` when the
+ * stage has no prompt (built-in policy applies), otherwise the prompt as is.
+ */
+export function customPromptPolicy(
+  stage: string,
+  input: StageInput | undefined,
+): CustomPrompt | undefined {
+  if (!input) return undefined;
+  validateCustomPrompt(stage, input.customPrompt);
+  return input.customPrompt;
+}
+
 export function toStageConfig(stage: string, input: StageInput): StageConfig {
   return {
     stage,
@@ -104,5 +154,7 @@ export function resolveConfig(input: ReviewHostConfig): ReviewHostConfig {
   }
   requireStage("primary", input.primary);
   requireStage("re-review", input.reReview);
+  validateCustomPrompt("primary", input.primary?.customPrompt);
+  validateCustomPrompt("re-review", input.reReview?.customPrompt);
   return input;
 }

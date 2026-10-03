@@ -3,13 +3,19 @@
  * and custom prompts). Layers, in order:
  *   1. Protocol instructions — fixed, not configurable.
  *   2. Review policy — the thermo-nuclear skill pinned at
- *      c47b12849e43f18d5c374c7069c744cc55b0ea00 (vendored verbatim).
+ *      c47b12849e43f18d5c374c7069c744cc55b0ea00 (vendored verbatim), or the
+ *      stage's custom prompt in replace mode.
  *   3. Repository instructions — main-branch guidance at a pinned revision; always included.
+ *   4. The stage's custom prompt in append mode.
  *
- * Custom prompts (ticket 10) are intentionally absent in ticket 01.
+ * Custom prompts change what a reviewer looks for and how it judges. They
+ * never touch the protocol layers (hand-off format, anchors, audit notes,
+ * publication rules), and they arrive only through the trusted workflow
+ * configuration — never through PR content.
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import type { CustomPrompt } from "./config.js";
 
 /** Pin provenance: cursor/plugins thermo-nuclear-code-quality-review skill. */
 export const REVIEW_POLICY_PIN = "c47b12849e43f18d5c374c7069c744cc55b0ea00";
@@ -52,17 +58,43 @@ export interface ResolvedInstructions {
   /** The single rendered instruction block handed to the stage's agent. */
   readonly text: string;
   readonly policyPin: string;
+  /** How the custom prompt was applied: `append`, `replace`, or none. */
+  readonly promptMode: "append" | "replace" | "none";
+  /** The custom prompt text resolved into the instructions, when any. */
+  readonly customPrompt?: string;
 }
 
-/** Resolve one stage's full instruction text. Pure; no I/O beyond reading the vendored policy. */
+/**
+ * Resolve one stage's full instruction text: the four layers in the spec's
+ * order. Pure; no I/O beyond reading the vendored policy. `prompt` comes from
+ * the stage's validated workflow-input configuration (ticket 10).
+ */
 export function resolveInstructions(
   role: "primary" | "re-review",
   repositoryInstructions: string,
+  customPrompt?: CustomPrompt | undefined,
 ): ResolvedInstructions {
   const layers: string[] = [protocolInstructions(role)];
-  layers.push(
-    `Review policy — Cursor's thermo-nuclear-code-quality-review skill, pinned at cursor/plugins@${REVIEW_POLICY_PIN}:\n\n${thermoNuclearPolicy()}`,
-  );
+  let promptMode: ResolvedInstructions["promptMode"] = "none";
+  let promptText: string | undefined;
+  if (customPrompt !== undefined && customPrompt.mode === "replace") {
+    layers.push(`Review policy — event-specific (workflow configuration, replace mode):\n\n${customPrompt.text.trim()}`);
+    promptMode = "replace";
+    promptText = customPrompt.text.trim();
+  } else {
+    layers.push(
+      `Review policy — Cursor's thermo-nuclear-code-quality-review skill, pinned at cursor/plugins@${REVIEW_POLICY_PIN}:\n\n${thermoNuclearPolicy()}`,
+    );
+  }
   layers.push(`Repository review instructions (main branch, pinned):\n${repositoryInstructions}`);
-  return { text: layers.join("\n\n"), policyPin: REVIEW_POLICY_PIN };
+  if (customPrompt !== undefined && customPrompt.mode === "append" && customPrompt.text.trim()) {
+    layers.push(
+      `Additional review focus — repository owner's custom prompt (workflow configuration, appended):\n\n${customPrompt.text.trim()}`,
+    );
+    promptMode = "append";
+    promptText = customPrompt.text.trim();
+  }
+  return promptText === undefined
+    ? { text: layers.join("\n\n"), policyPin: REVIEW_POLICY_PIN, promptMode }
+    : { text: layers.join("\n\n"), policyPin: REVIEW_POLICY_PIN, promptMode, customPrompt: promptText };
 }

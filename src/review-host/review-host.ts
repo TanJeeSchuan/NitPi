@@ -22,8 +22,15 @@ import { RestGitHubApi } from "../github/rest-api.js";
 import { Publisher } from "../github/publisher.js";
 import { createBridgedProvider } from "../pi-bridge/provider-bridge.js";
 import { ensureStageCheckouts, CheckoutError } from "./checkouts.js";
-import { isFullSha, resolveConfig, type ReviewHostConfig } from "./config.js";
-import { resolveInstructions } from "./instructions.js";
+import {
+  isFullSha,
+  resolveConfig,
+  validateCustomPrompt,
+  type CustomPrompt,
+  type StageInput,
+  type ReviewHostConfig,
+} from "./config.js";
+import { resolveInstructions, type ResolvedInstructions } from "./instructions.js";
 import { RunHistory, type RunDocument } from "./run-history.js";
 import { type GitHubApi } from "../github/publisher.js";
 import {
@@ -32,6 +39,7 @@ import {
   type ReviewRunRequest,
   type ReviewTaskDeps,
 } from "./review-task.js";
+import type { StageInstructionsRecord } from "./run-history.js";
 
 export interface ReviewHost {
   /**
@@ -44,6 +52,13 @@ export interface ReviewHost {
     pullNumber: number;
     requester: string;
   }): Promise<{ runId: string; refused?: string; conversationId: string }>;
+  /**
+   * Ticket 10 test seam: change one stage's custom prompt between runs, the
+   * way a workflow-input edit changes the trusted configuration. Runs already
+   * in progress are unaffected — their instructions are stored on the run
+   * document.
+   */
+  replaceInstructions(role: "primary" | "re-review", prompt: CustomPrompt | undefined): void;
   /** Resolves when the run's durable task reaches a terminal state. */
   waitForRun(runId: string): Promise<void>;
   /** Aggregate Pi usage for assertion by tests. */
@@ -120,7 +135,7 @@ class ReviewHostImpl implements ReviewHost {
     private readonly harness: Harness,
     private readonly history: RunHistory,
     private readonly models: Models,
-    private readonly config: ReviewHostConfig,
+    private config: ReviewHostConfig,
     private readonly api: GitHubApi,
   ) {}
 
@@ -189,10 +204,18 @@ class ReviewHostImpl implements ReviewHost {
       subject.pullNumber,
       context,
     );
+
+    // Ticket 10: resolve both stages' instructions once, at run start, from
+    // the workflow configuration. The resolved text is stored with the run
+    // before any model call, so recovery reuses exactly what this run started
+    // with even if the configuration changes mid-run.
+    const resolved = {
+      primary: this.storedInstructions("primary"),
+      reReview: this.storedInstructions("re-review"),
+    };
     if (!canonicalId) {
-      const primaryInstructions = resolveInstructions("primary", this.config.repositoryInstructions);
       const canonical = await this.history.createCanonicalConversation(
-        { modelId: this.config.primary.modelId, instructions: primaryInstructions.text },
+        { modelId: this.config.primary.modelId, instructions: resolved.primary.text },
         context,
       );
       canonicalId = canonical.id as unknown as string;
@@ -216,6 +239,7 @@ class ReviewHostImpl implements ReviewHost {
         pipelineTaskId: taskId as unknown as string,
         canonicalConversationId: canonicalId!,
         artifactFrozen: false,
+        resolvedInstructions: resolved,
         checkStatus: "in progress",
         checkDetail: "stage: primary",
         checkouts,
@@ -230,6 +254,36 @@ class ReviewHostImpl implements ReviewHost {
       this.harness.waitForTask(started.taskId, TODO_CONTEXT).then(() => undefined),
     );
     return { runId: started.runId, conversationId: canonicalId! };
+  }
+
+  /**
+   * Ticket 10: one stage's resolved instructions for this run, from the
+   * configuration the host was opened with.
+   */
+  storedInstructions(role: "primary" | "re-review"): StageInstructionsRecord {
+    const stage = role === "primary" ? this.config.primary : this.config.reReview;
+    const resolved: ResolvedInstructions = resolveInstructions(
+      role,
+      this.config.repositoryInstructions,
+      stage?.customPrompt,
+    );
+    return {
+      text: resolved.text,
+      policyPin: resolved.policyPin,
+      promptMode: resolved.promptMode,
+      ...(resolved.customPrompt !== undefined ? { customPrompt: resolved.customPrompt } : {}),
+    };
+  }
+
+  replaceInstructions(role: "primary" | "re-review", prompt: CustomPrompt | undefined): void {
+    const stage = role === "primary" ? this.config.primary : this.config.reReview;
+    const next: StageInput = { ...stage, ...(prompt ? { customPrompt: prompt } : {}) };
+    if (!prompt) delete (next as { customPrompt?: unknown }).customPrompt;
+    validateCustomPrompt(role, next.customPrompt);
+    this.config =
+      role === "primary"
+        ? { ...this.config, primary: next }
+        : { ...this.config, reReview: next };
   }
 
   async waitForRun(runId: string): Promise<void> {
