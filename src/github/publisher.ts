@@ -105,7 +105,7 @@ export interface GitHubApi {
           name: string;
           head_sha: string;
           status: "completed";
-          conclusion: "success" | "failure" | "neutral" | "skipped" | "action_required";
+          conclusion: "success" | "failure" | "neutral" | "skipped" | "action_required" | "cancelled";
           output: { title: string; summary: string };
         },
   ): Promise<HttpResponse>;
@@ -570,6 +570,24 @@ export class Publisher {
     });
     if (response.status !== 201) {
       throw new PublishError(`check-run completion failed with HTTP ${response.status}`);
+    }
+  }
+
+  /**
+   * A cancelled run (ticket 09): GitHub's own `cancelled` conclusion, the
+   * same status channel failure/incomplete use — a cancellation status, not
+   * a publication (no review, comment or thread write).
+   */
+  async checkCancelled(subject: RunDocument["subject"], reason: string): Promise<void> {
+    const response = await this.api.createCheckRun(subject.repository, {
+      name: CHECK_NAME,
+      head_sha: subject.headSha,
+      status: "completed",
+      conclusion: "cancelled",
+      output: { title: "Review cancelled", summary: reason },
+    });
+    if (response.status !== 201) {
+      throw new PublishError(`check-run cancellation failed with HTTP ${response.status}`);
     }
   }
 

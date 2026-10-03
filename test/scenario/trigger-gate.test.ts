@@ -212,7 +212,8 @@ describe("scenario: trigger gate refuses and explains", () => {
         expect(cancel.outcome).toBe("refused");
         expect(cancel.refused).toContain("is not a repository writer or maintainer");
 
-        // A writer is permitted; /review cancel's run behaviour is ticket 09.
+        // A writer is permitted; with no active run a cancel is refused with
+        // a reason (ticket 09: it stops an active run, it starts nothing).
         // (A writer's /review clean starts a clean run: ticket 07's scenarios.)
         const writerCancel = await stage.host.handleReviewCommand({
           repository: "example/widgets",
@@ -222,7 +223,7 @@ describe("scenario: trigger gate refuses and explains", () => {
           deliveryKey: "comment-1005",
         });
         expect(writerCancel.outcome).toBe("refused");
-        expect(writerCancel.refused).toContain("ticket 09");
+        expect(writerCancel.refused).toContain("no active review to cancel");
         expect(await runsOf(stage.host)).toHaveLength(0);
       },
     );

@@ -75,9 +75,10 @@ export interface ReviewHost {
    * Trigger gate entry: all issue-comment commands (`/review`, `/review
    * clean`, `/review cancel`). The gate applies the same requester check to
    * each; `/review` starts one normal run for the current head, `/review
-   * clean` one clean run (ticket 07); `/review cancel` is wired by ticket 09. Refusals return a reason. A
-   * failed attempt for the same head is resumed rather than restarted
-   * (ticket 06).
+   * clean` one clean run (ticket 07), `/review cancel` stops the active run
+   * through the abort API and records the durable cancellation fence
+   * (ticket 09). Refusals return a reason. A failed attempt for the same
+   * head is resumed rather than restarted (ticket 06).
    */
   handleReviewCommand(command: {
     repository: string;
@@ -91,9 +92,13 @@ export interface ReviewHost {
    * Automatic-trigger entry: a pull-request event (opened, reopened,
    * synchronize, ready_for_review). A no-op in manual mode. Refusals are
    * recorded on GitHub as skipped or action-required checks.
+   *
+   * Ticket 09 stop events: `closed` (the state GitHub records after a plain
+   * close or a merge) and `converted_to_draft` cancel the active run the
+   * same way and drop the pending request.
    */
   handlePullRequestEvent(event: {
-    action: "opened" | "reopened" | "synchronize" | "ready_for_review";
+    action: "opened" | "reopened" | "synchronize" | "ready_for_review" | "closed" | "converted_to_draft";
     repository: string;
     pullNumber: number;
     sender: string;
@@ -247,15 +252,33 @@ class ReviewHostImpl implements ReviewHost {
   }
 
   async handlePullRequestEvent(event: {
-    action: "opened" | "reopened" | "synchronize" | "ready_for_review";
+    action: "opened" | "reopened" | "synchronize" | "ready_for_review" | "closed" | "converted_to_draft";
     repository: string;
     pullNumber: number;
     sender: string;
     deliveryKey?: string;
   }): Promise<{ runId: string; refused?: string; conversationId: string; outcome?: GateEvaluation["outcome"] }> {
-    return this.enqueue(event.repository, event.pullNumber, () =>
-      this.processEvaluation({ kind: "pull-request", ...event }),
-    );
+    return this.enqueue(event.repository, event.pullNumber, () => {
+      if (event.action === "closed" || event.action === "converted_to_draft") {
+        const stopEvent: Extract<TriggerEvent, { kind: "pull-request-stop" }> = {
+          kind: "pull-request-stop",
+          action: event.action,
+          repository: event.repository,
+          pullNumber: event.pullNumber,
+          sender: event.sender,
+          ...(event.deliveryKey !== undefined ? { deliveryKey: event.deliveryKey } : {}),
+        };
+        return this.processEvaluation(stopEvent);
+      }
+      return this.processEvaluation({
+        kind: "pull-request",
+        action: event.action,
+        repository: event.repository,
+        pullNumber: event.pullNumber,
+        sender: event.sender,
+        ...(event.deliveryKey !== undefined ? { deliveryKey: event.deliveryKey } : {}),
+      });
+    });
   }
 
   /**
@@ -288,6 +311,16 @@ class ReviewHostImpl implements ReviewHost {
     switch (evaluation.outcome) {
       case "start":
         return this.startRun(evaluation.request, evaluation.deliveryKey);
+      case "cancel":
+        // /review cancel (ticket 09): the requester is a writer and an active
+        // run exists; the host aborts it and records the durable fence.
+        return this.cancelRun(evaluation.reason, evaluation.requester);
+      case "stop-cancelled":
+        // Close / merge / draft conversion (ticket 09): the gate already
+        // dropped the pending request durably; the host aborts the active run
+        // with the same fence a `/review cancel` records.
+        await this.cancelRun(evaluation.reason, evaluation.requester);
+        return { runId: "", conversationId: "", outcome: "stop-cancelled" };
       case "satisfied":
         // A running review already covers the head: join its run. On a
         // re-opened host the run's recorded pipeline task survives (pending at
@@ -593,6 +626,78 @@ class ReviewHostImpl implements ReviewHost {
 
     this.trackTask(started.runId, started.taskId as unknown as string, request.repository, request.pullNumber);
     return { runId: started.runId, conversationId: canonicalId!, outcome: "start" as const };
+  }
+
+  /**
+   * Ticket 09: stop the pull request's active run — through Pi Durable's
+   * abort API, so the pipeline is interrupted exactly like a host crash —
+   * then paste the durable cancellation fence on the run document, and mark
+   * the run cancelled with a reason. History is kept, and the pending
+   * request and automatic mode stay untouched (the fence is what drops
+   * neither: those belong to close/merge/draft, ticket 09's AC 2).
+   *
+   * Runs inside the PR chain: concurrent triggers cannot interleave a
+   * restart before the fence, because every start decision happens in the
+   * same per-PR serial chain the cancellation is evaluated in.
+   */
+  private async cancelRun(
+    reason: string,
+    by: string,
+  ): Promise<{
+    runId: string;
+    refused?: string;
+    conversationId: string;
+    outcome?: GateEvaluation["outcome"];
+  }> {
+    const active = await this.gate.findActiveRun(this.config.repository, this.config.pullNumber);
+    if (!active) {
+      // The run ended while the requester was being permission-checked:
+      // refusal with a reason, no fence, no check.
+      return { runId: "", refused: "no active review to cancel", conversationId: "", outcome: "refused" };
+    }
+    await this.recordCancellation(active, reason, by);
+    return { runId: active.runId, conversationId: active.canonicalConversationId, outcome: "cancel" };
+  }
+
+  /**
+   * Abort the run's pipeline task (Pi's abort API: signal + abort invocation
+   * with its fence check) and record the cancellation fence in ONE step. The
+   * abort waits out the active run invocation before it returns, so this
+   * resolves with the run interrupted exactly like a host crash.
+   */
+  private async recordCancellation(run: RunDocument, reason: string, by: string): Promise<void> {
+    // Fence in the same parallel step: it must be committed before the abort
+    // invocation runs (its protocol check reads the fence), but concurrent
+    // triggers are held by the PR chain while this chain runs.
+    const [abortResult] = await Promise.all([
+      this.harness.abortTask(run.pipelineTaskId as never, TODO_CONTEXT).catch(() => "marked" as const),
+      this.fenceRun(run, reason, by),
+    ]);
+    if (abortResult === "marked") {
+      // The abort invocation runs after this commit; the tracked wait keeps
+      // the host's drain loop / waitForRun semantics working as with any run.
+      this.trackTask(run.runId, run.pipelineTaskId, run.subject.repository, run.subject.pullNumber);
+    }
+  }
+
+  /**
+   * The run document is the fence (ticket 09): `cancelled` present in the
+   * run ⇒ every later phase turn stops, publishes nothing, and marks the
+   * run cancelled. The abort invocation's fence check reads it before its
+   * protocol work; recovery reads it in its first commit. One commit that
+   * cannot be skipped: storage being down means the fence cannot be recorded
+   * and the host surfaces the failure instead of pretending it cancelled.
+   */
+  private async fenceRun(run: RunDocument, reason: string, by: string): Promise<void> {
+    await this.harness.commit(async (tx) => {
+      const current = await this.history.findRunInTx(tx, run.runId);
+      if (!current) return; // Nothing readable: no fence elsewhere anyway.
+      if (current.cancelled) return; // A prior event already fenced it.
+      await this.history.record(tx, {
+        ...current,
+        cancelled: { by, reason, at: Date.now() },
+      });
+    }, TODO_CONTEXT);
   }
 
   /** Actions re-run: pick the same attempt back up on a new durable task. */

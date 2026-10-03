@@ -66,3 +66,7 @@ _Avoid_: retry queue, backlog of requests
 **Stale run**:
 A run that finished after the pull request's head moved on or the pull request stopped being open. It is kept in history attributed to the head it reviewed and publishes nothing.
 _Avoid_: outdated review, lost review
+
+**Cancelled run**:
+A run whose pending work was stopped by `/review cancel` or by the pull request closing, merging, or becoming a draft. The cancellation is fenced on the run document: it publishes nothing, is never a completed result, and recovery never restarts it. Losing the Actions job is not a cancellation — such a run stays resumable.
+_Avoid_: aborted review, killed run

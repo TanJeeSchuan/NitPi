@@ -64,6 +64,18 @@
  * skipped" — never as a success for the newer head. The check runs in the
  * match phase (before the matching turn and its bookkeeping) and again in
  * the publish phase, so a push landing between the two is still caught.
+ *
+ * Cancellation (ticket 09): a run document with `cancelled` set is a fence
+ * for every phase. A turn that starts on a fenced run commits the
+ * cancellation and ends the task terminal-completed — the work is
+ * permanently stopped, so recovery must not restart it (the resume rules
+ * ignore exhausted tasks). The abort invocation — entered through Pi's
+ * abort API by `/review cancel`, a close, a merge or a draft conversion —
+ * commits the same fence-check first: a publication write in flight aborts
+ * (its signal is cancelled) and, even if the GitHub write itself landed,
+ * the run records itself as cancelled — never as a completed result. A run
+ * cancelled before publication was attempted shows no check at all; the
+ * cancellation itself surfaces through the check channel.
  */
 import type { Context } from "@earendil-works/chord";
 import { TODO_CONTEXT } from "@earendil-works/chord/context";
@@ -95,7 +107,6 @@ import type {
   StageInstructionsRecord,
   StageUsage,
 } from "./run-history.js";
-
 /** The review commands the trigger gate accepts today (ticket 09 widens it
  *  with `cancel`). */
 export type ReviewCommand = "/review" | "/review clean";
@@ -166,6 +177,7 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
     primary: async (task, runtime, context) => {
       try {
         const host = reviewTaskDeps();
+        await throwIfCancelled(host, task.input.runId, context);
         const runDoc = await host.runHistory.findRun(task.input.runId, context);
         if (!runDoc) throw new Error(`run ${task.input.runId} is not recorded`);
 
@@ -239,6 +251,7 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
 
         await advancePhase(runtime, context, "re-review");
       } catch (error) {
+        if (error instanceof CancelledError) return finishCancelled(reviewTaskDeps(), task, runtime, context, error);
         if (isKilledInvocation(runtime)) return;
         await failRun(task.input, context, error);
       }
@@ -247,6 +260,7 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
     "re-review": async (task, runtime, context) => {
       try {
         const host = reviewTaskDeps();
+        await throwIfCancelled(host, task.input.runId, context);
         const runDoc = await host.runHistory.findRun(task.input.runId, context);
         if (!runDoc) throw new Error(`run ${task.input.runId} is not recorded`);
         if (!runDoc.artifact) throw new Error("primary artifact is not frozen");
@@ -359,6 +373,7 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
 
         await advancePhase(runtime, context, "match");
       } catch (error) {
+        if (error instanceof CancelledError) return finishCancelled(reviewTaskDeps(), task, runtime, context, error);
         await failRun(task.input, context, error);
       }
     },
@@ -366,6 +381,7 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
     match: async (task, runtime, context) => {
       try {
         const host = reviewTaskDeps();
+        await throwIfCancelled(host, task.input.runId, context);
         const runDoc = await host.runHistory.findRun(task.input.runId, context);
         if (!runDoc?.finalReview) throw new Error("final review is not frozen");
         // Ticket 08: a run whose pull request moved on while it reviewed
@@ -434,8 +450,10 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
         // Clean runs (ticket 07) import their completed report before
         // publication; normal runs review in the canonical conversation and
         // have nothing to import.
+        await throwIfCancelled(host, task.input.runId, context);
         await advancePhase(runtime, context, runDoc.mode === "clean" ? "import" : "publish");
       } catch (error) {
+        if (error instanceof CancelledError) return finishCancelled(reviewTaskDeps(), task, runtime, context, error);
         if (isKilledInvocation(runtime)) return;
         await failRun(task.input, context, error);
       }
@@ -443,28 +461,44 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
 
     publish: async (task, runtime, context) => {
       const host = reviewTaskDeps();
-      const runDoc = await host.runHistory.findRun(task.input.runId, context);
-      if (!runDoc?.finalReview) throw new Error("final review is not frozen");
-      // Ticket 08: re-check before any publish-phase write — a push (or a
-      // close) landing between the match-phase check and here is caught now.
-      const stale = await publicationStaleness(host, runDoc);
-      if (stale) {
-        await finishStaleSkip(host, task, runtime, context, stale);
-        return;
-      }
-      const publisher = new Publisher(host.api);
-      const subject = runDoc.subject;
-
       try {
+        await throwIfCancelled(host, task.input.runId, context);
+        const runDoc = await host.runHistory.findRun(task.input.runId, context);
+        if (!runDoc?.finalReview) throw new Error("final review is not frozen");
+        // Ticket 08: re-check before any publish-phase write — a push (or a
+        // close) landing between the match-phase check and here is caught now.
+        const stale = await publicationStaleness(host, runDoc);
+        if (stale) {
+          await finishStaleSkip(host, task, runtime, context, stale);
+          return;
+        }
+        // Ticket 09: the fence again after the staleness round-trip — the
+        // cancel may have landed while the pull request was being read.
+        await throwIfCancelled(host, task.input.runId, context);
+        const publisher = new Publisher(host.api);
+        const subject = runDoc.subject;
+
         await publisher.checkInProgress(subject, "publish");
-        const published = await publisher.publish(
-          runDoc,
-          runDoc.finalReview,
-          runDoc.findings ?? [],
-          runDoc.earlierComments ?? [],
-          runDoc.matches ?? [],
-          context.abortSignal,
+        // Ticket 09: the publication write races the run's abort signal — a
+        // cancel mid-write stops waiting for GitHub and the run below ends
+        // cancelled (the write itself may still have landed on GitHub; the
+        // durable state never records it as this run's completed result).
+        const published = await abortablePublisherCall(
+          runtime.signal,
+          () =>
+            publisher.publish(
+              runDoc,
+              runDoc.finalReview!,
+              runDoc.findings ?? [],
+              runDoc.earlierComments ?? [],
+              runDoc.matches ?? [],
+              context.abortSignal,
+            ),
         );
+        // Ticket 09: the fence AFTER the publication write too — a cancel
+        // that landed during the write means the run ends cancelled, never
+        // as a completed result, even though GitHub may hold the review.
+        await throwIfCancelled(host, task.input.runId, context);
         await commitRunUpdate(host, task.input.runId, context, (run) => ({
           ...run,
           publication: { reviewId: published.reviewId, commentIds: published.commentIds },
@@ -486,6 +520,7 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
           context,
         );
       } catch (error) {
+        if (error instanceof CancelledError) return finishCancelled(reviewTaskDeps(), task, runtime, context, error);
         if (isKilledInvocation(runtime)) return; // A dead runner records nothing.
         // Record the failure on the run document and GitHub. Storage being
         // down must not itself turn into a crash here: the run doc update is
@@ -506,6 +541,7 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
     import: async (task, runtime, context) => {
       try {
         const host = reviewTaskDeps();
+        await throwIfCancelled(host, task.input.runId, context);
         const runDoc = await host.runHistory.findRun(task.input.runId, context);
         // Invariant, not a duplicate decision: the routing in the match phase
         // must never send a normal run here; the frozen-final-review and
@@ -522,18 +558,48 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
           context,
         );
       } catch (error) {
+        if (error instanceof CancelledError) return finishCancelled(reviewTaskDeps(), task, runtime, context, error);
         await failRun(task.input, context, error);
       }
     },
   },
   abort: async (task, runtime, context) => {
-    // Durable cancellation: nothing publishes after abort (ticket 09 refines
-    // the fence). The run document already carries the stage's reason when
-    // this follows a failed stage; the check status flips to failure here.
-    await commitRunUpdateSafe(reviewTaskDeps(), task.input.runId, context, (run) => ({
-      ...run,
-      checkStatus: "failure",
-    }));
+    // Durable cancellation (ticket 09): the abort invocation runs once, after
+    // the run's ordinary owned work is gone — through Pi's abort API, entered
+    // by `/review cancel`, a close, a merge or a draft conversion. The fence
+    // (`cancelled` on the run document) was committed before the abort mark;
+    // this invocation records the cancelled outcome. The host's own
+    // fence-check in each phase covers an abort whose invocation has not run
+    // yet. Nothing publishes after abort: a publication write in flight has
+    // its signal cancelled, and even when the write itself landed, the run
+    // below records cancelled — never a completed result.
+    const host = reviewTaskDeps();
+    try {
+      const run = await host.runHistory.findRun(task.input.runId, context);
+      const reason = run?.cancelled?.reason ?? "review canceled";
+      if (!run?.cancelled) {
+        // No fence (an abort that did not come from ticket 09's executor,
+        // e.g. host close with a mark from an earlier lifecycle): keep the
+        // job-loss semantics — nothing more is recorded here.
+        await commitRunUpdateSafe(host, task.input.runId, context, (current) => ({
+          ...current,
+          checkStatus: "failure",
+        }));
+      } else {
+        await commitRunUpdateSafe(host, task.input.runId, context, (current) => ({
+          ...current,
+          phase: "cancelled" as const,
+          checkStatus: "cancelled" as const,
+          checkDetail: reason,
+        }));
+        await new Publisher(host.api)
+          .checkCancelled(run.subject, reason)
+          .catch(() => undefined);
+      }
+    } catch {
+      // Storage unreachable: the task still ends below; the run document
+      // keeps whatever state it had.
+    }
     await runtime.commit(
       (_tx) =>
         ({
@@ -556,6 +622,30 @@ class StageTimeout extends Error {
     super(`${stage} reviewer exceeded its ${deadlineMs}ms deadline`);
     this.name = "StageTimeout";
   }
+}
+
+/** Thrown by the cancellation fence (ticket 09) when a phase turn starts on
+ * (or reaches) a cancelled run: not an error to report on GitHub — the
+ * `finishCancelled` path records the cancellation. */
+class CancelledError extends Error {
+  constructor(
+    readonly reason: string,
+  ) {
+    super(`review cancelled: ${reason}`);
+    this.name = "CancelledError";
+  }
+}
+
+/**
+ * The cancellation fence (ticket 09): throw `CancelledError` when the run
+ * document carries `cancelled`, so the caller's catch ends the run without
+ * any further write. The fence is re-checked at every phase boundary and
+ * before and after the publication write — a publication child task whose
+ * GitHub call landed anyway still ends here, never as a completed result.
+ */
+async function throwIfCancelled(host: ReviewTaskDeps, runId: string, context: Context): Promise<void> {
+  const run = await host.runHistory.findRun(runId, context);
+  if (run?.cancelled) throw new CancelledError(run.cancelled.reason);
 }
 
 /** Advance the pipeline to the next phase as one durable checkpoint. */
@@ -633,6 +723,77 @@ async function finishStaleSkip(
       }) as const,
     context,
   );
+}
+
+/**
+ * The cancellation path (ticket 09): record the run as cancelled — phase
+ * `cancelled`, check status `cancelled` with the reason — and end the task
+ * terminal-completed. The durable work of the run stays in history, but the
+ * run is never a completed result, publishes nothing, and is never resumed
+ * (exhausted): recovery reads this state and leaves it alone. The
+ * cancellation check itself is the one GitHub write — the run's own status
+ * channel, like failure/incomplete; no review, comment or thread write.
+ */
+async function finishCancelled(
+  host: ReviewTaskDeps,
+  task: RunningTask<ReviewTaskInput, ReviewCheckpoint, ReviewTaskResult>,
+  runtime: ReviewRuntime,
+  context: Context,
+  error: CancelledError,
+): Promise<void> {
+  await commitRunUpdateSafe(host, task.input.runId, context, (run) => ({
+    ...run,
+    phase: "cancelled" as const,
+    checkStatus: "cancelled" as const,
+    checkDetail: error.reason,
+  }));
+  const run = await host.runHistory.findRun(task.input.runId, context);
+  const subject: RunDocument["subject"] =
+    run?.subject ?? {
+      repository: task.input.request.repository,
+      pullNumber: task.input.request.pullNumber,
+      baseSha: task.input.request.baseSha,
+      headSha: task.input.request.headSha,
+    };
+  // The run's own check channel, not a publication: same as checkFailure.
+  await new Publisher(host.api)
+    .checkCancelled(subject, error.reason)
+    .catch(() => undefined);
+  await runtime.commit(
+    (_tx) =>
+      ({
+        status: "terminal" as const,
+        outcome: {
+          status: "completed" as const,
+          result: { published: false as const, reason: `review cancelled: ${error.reason}` },
+        },
+      }) as const,
+    context,
+  );
+}
+
+/**
+ * Await a publication write, but stop waiting when the run's abort signal
+ * fires (ticket 09): the in-flight HTTP call is abandoned and an abort lands
+ * as the caller's normal cancellation path. The write itself may still have
+ * reached GitHub; durable state records the run as cancelled regardless.
+ */
+async function abortablePublisherCall<T>(signal: AbortSignal, call: () => Promise<T>): Promise<T> {
+  if (signal.aborted) throw new DOMException("The operation was aborted.", "AbortError");
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new DOMException("The operation was aborted.", "AbortError"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    call().then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      },
+    );
+  });
 }
 
 /** Merge this turn's usage into the run document (strict JSON: absent key,

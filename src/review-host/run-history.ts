@@ -37,7 +37,12 @@ export type RunPhase =
   /** Terminal (ticket 08): the run completed its review, but the pull
    *  request's head moved on or the pull request is no longer open before
    *  publication. History only: nothing is posted to GitHub. */
-  | "GitHub skipped";
+  | "GitHub skipped"
+  /** Functionally terminal (ticket 09): the run's pending work was
+   *  cancelled (a `/review cancel`, or the pull request closed, merged or
+   *  became a draft) and nothing may ever start or publish again. History
+   *  keeps the run; recovery must not restart its exhausted task. */
+  | "cancelled";
 
 /** Token usage of one settling assistant message. */
 export interface StageUsage {
@@ -135,9 +140,18 @@ export interface RunDocument {
   /** Per-stage unchanged checkouts of the reviewed head. */
   checkouts?: { primary: string; reReview: string };
   usage?: RunUsage;
-  checkStatus: "in progress" | "success" | "failure" | "skipped";
+  checkStatus: "in progress" | "success" | "failure" | "skipped" | "cancelled";
   checkDetail?: string;
   error?: string;
+  /**
+   * Cancellation fence (ticket 09): set once, with who cancelled and why.
+   * Present ⇒ the run's pending work stops everywhere: no model call, no
+   * publication (a publication child task already in progress aborts with
+   * no writes), and recovery never restarts the exhausted task. History
+   * keeps the run under `phase: "cancelled"`; the run is never a completed
+   * result.
+   */
+  cancelled?: { by: string; reason: string; at: number };
 }
 
 type RunsRegistryValue = { [key: string]: JsonValueLike } & { runs: RunDocument[] };
