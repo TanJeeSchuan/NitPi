@@ -133,15 +133,20 @@ export function resolveConfig(input: ReviewHostConfig): ReviewHostConfig {
     if (input.autoMode.mode !== "manual" && input.autoMode.mode !== "automatic") {
       throw new ConfigError(`autoMode.mode must be "manual" or "automatic", got ${String(input.autoMode.mode)}`);
     }
+    if (!input.autoMode.events) {
+      throw new ConfigError(
+        `autoMode.events is required (all four toggles must be booleans when autoMode is set)`,
+      );
+    }
     for (const toggle of ["opened", "reopened", "synchronize", "readyForReview"] as const) {
       if (typeof input.autoMode.events[toggle] !== "boolean") {
         throw new ConfigError(`autoMode.events.${toggle} must be a boolean`);
       }
     }
-    if (input.autoMode.mode === "automatic" && (input.autoMode.waitForChecks?.length ?? 0) > 0) {
-      if (input.autoMode.waitForChecks!.some((name) => !name.trim())) {
-        throw new ConfigError("autoMode.waitForChecks entries must be non-empty check names");
-      }
+    if ((input.autoMode.waitForChecks?.length ?? 0) > 0 && input.autoMode.waitForChecks!.some((name) => !name.trim())) {
+      // Validated in every mode: a typo must not be silently ignored when the
+      // operator later flips the mode to automatic.
+      throw new ConfigError("autoMode.waitForChecks entries must be non-empty check names");
     }
   }
   requireStage("primary", input.primary);

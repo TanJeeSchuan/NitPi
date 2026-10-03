@@ -123,6 +123,12 @@ export interface PendingRequestDoc {
   action?: PrAction;
   requester?: string;
   headSha?: string;
+  /**
+   * The delivery key of the queued trigger. Recorded durably in the same
+   * commit that creates the run, so a redelivery of the same comment or
+   * event after the queued run finished is a duplicate, not a second run.
+   */
+  deliveryKey?: string;
   requestedAt: number;
 }
 
@@ -157,12 +163,37 @@ export const GateRegistry = defineDoc<GateRegistryState>({
 const DELIVERED_WINDOW = 400;
 export { DELIVERED_WINDOW };
 
+/**
+ * Store one pull request's newest pending request, pruning the delivery key
+ * of a request it replaces: coalescing drops the older request (reducer:
+ * newest eligible head wins), so its delivery must count as consumed, or a
+ * redelivery of it would start a second review.
+ */
+function storePending(
+  gate: GateRegistryState,
+  repository: string,
+  pullNumber: number,
+  pending: PendingRequestDoc,
+): void {
+  const key = prKey(repository, pullNumber);
+  const replaced = gate.pendingByPr[key];
+  if (replaced?.deliveryKey && replaced.deliveryKey !== pending.deliveryKey) {
+    gate.delivered = [
+      ...gate.delivered,
+      { key: replaced.deliveryKey, at: Date.now() },
+    ].slice(-DELIVERED_WINDOW);
+  }
+  gate.pendingByPr[key] = pending;
+}
+
 export const prKey = (repository: string, pullNumber: number): string => `${repository}#${pullNumber}`;
 
 /**
  * Dedup identity of a delivered trigger. An explicit workflow delivery id
- * (GitHub's delivery GUID) decides alone; without one the gate falls back to
- * a per-trigger composite.
+ * (GitHub's delivery GUID) decides alone — that is the production contract
+ * (ticket 11 wiring supplies it); without one the composite fallback can
+ * conflate distinct triggers that coincide on requester/action/head, so
+ * `deliveryKey` should always be supplied in the workflow.
  */
 export function eventKeyOf(event: TriggerEvent, headSha?: string): string {
   const pr = prKey(event.repository, event.pullNumber);
@@ -311,7 +342,7 @@ export class TriggerGate {
         // A running review of the same head satisfies the command; a command
         // on a newer head queues behind the active run (coalesced catch-up).
         if (active.subject.headSha === headSha) return { outcome: "satisfied", run: active };
-        return this.queueCommand(event, deliveryKey, headSha);
+        return this.queueCommand(event, deliveryKey, headSha, isFork(body));
       }
       // /review clean and /review cancel behave later (tickets 07/09); the
       // gate recognises them but their run wiring is not built yet.
@@ -356,20 +387,29 @@ export class TriggerGate {
     };
   }
 
-  /** Queue a command behind the active run; the drain starts it next. */
+  /** Queue a command behind the active run; the drain starts it next. A
+   * writer's queued command approves the current head of a fork, too. */
   private async queueCommand(
     event: Extract<TriggerEvent, { kind: "comment" }>,
     deliveryKey: string,
     headSha: string,
+    fork: boolean,
   ): Promise<GateEvaluation> {
     await this.commitGateState((gate) => {
-      gate.pendingByPr[prKey(event.repository, event.pullNumber)] = {
+      if (fork) {
+        gate.approvals = [
+          ...gate.approvals.filter((a) => !(a.repository === event.repository && a.pullNumber === event.pullNumber)),
+          { repository: event.repository, pullNumber: event.pullNumber, headSha, approvedBy: event.requester },
+        ];
+      }
+      storePending(gate, event.repository, event.pullNumber, {
         source: "command",
         command: "/review",
         requester: event.requester,
         headSha,
+        deliveryKey,
         requestedAt: Date.now(),
-      };
+      });
     });
     return { outcome: "queued", deliveryKey };
   }
@@ -441,11 +481,12 @@ export class TriggerGate {
     // request: the drain re-evaluates until they have completed on the head.
     if ((this.auto.waitForChecks?.length ?? 0) > 0 || (await this.findActiveRunAnyHead(event.repository, event.pullNumber))) {
       await this.commitGateState((gate) => {
-        gate.pendingByPr[prKey(event.repository, event.pullNumber)] = {
+        storePending(gate, event.repository, event.pullNumber, {
           source: "automatic",
           action: event.action,
+          deliveryKey,
           requestedAt: Date.now(),
-        };
+        });
       });
       return { outcome: "queued", deliveryKey };
     }
@@ -613,13 +654,13 @@ export class TriggerGate {
     if (pending.source === "automatic") {
       return {
         outcome: "start",
-        deliveryKey: `pending:${key}:${headSha}`,
+        deliveryKey: pending.deliveryKey ?? `pending:${key}:${headSha}`,
         request: { source: "automatic", repository, pullNumber, baseSha, headSha, command: "/review", triggeredBy: "automatic review of the newest eligible head" },
       };
     }
     return {
       outcome: "start",
-      deliveryKey: `pending:${key}:${pending.headSha ?? headSha}`,
+      deliveryKey: pending.deliveryKey ?? `pending:${key}:${pending.headSha ?? headSha}`,
       request: {
         source: "command",
         repository,
@@ -702,12 +743,6 @@ export class TriggerGate {
     );
   }
 
-  /** Record a delivery key durably; call with the run creation or on refusal. */
-  async recordDelivery(deliveryKey: string): Promise<void> {
-    await this.commitGateState((gate) => {
-      gate.delivered = [...gate.delivered, { key: deliveryKey, at: Date.now() }].slice(-DELIVERED_WINDOW);
-    });
-  }
 }
 
 export type { Tx };

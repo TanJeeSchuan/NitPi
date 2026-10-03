@@ -505,12 +505,126 @@ describe("scenario: automatic mode and toggles", () => {
     expect(preset.events).toEqual({ opened: true, reopened: true, synchronize: true, readyForReview: true });
     expect(preset.waitForChecks).toBeUndefined();
   });
+
+  it("each toggle runs its own event and nothing else (reopened, ready_for_review on; synchronize off)", async () => {
+    await withStage(
+      {
+        primaryScript: [NO_FINDINGS_PRIMARY[0]!, NO_FINDINGS_PRIMARY[0]!],
+        reReviewScript: [NO_FINDINGS_REREVIEW[0]!, NO_FINDINGS_REREVIEW[0]!],
+        autoMode: {
+          mode: "automatic",
+          events: { opened: false, reopened: true, synchronize: false, readyForReview: true },
+        },
+      },
+      async (stage) => {
+        // synchronize toggle off: a new commit requests nothing.
+        const sync = await stage.host.handlePullRequestEvent({
+          action: "synchronize",
+          repository: "example/widgets",
+          pullNumber: 7,
+          sender: "octocat",
+          deliveryKey: "matrix-sync-off",
+        });
+        expect(sync.outcome).toBe("ignored");
+
+        // reopened toggle on: the run starts without any command.
+        const reopened = await stage.host.handlePullRequestEvent({
+          action: "reopened",
+          repository: "example/widgets",
+          pullNumber: 7,
+          sender: "octocat",
+          deliveryKey: "matrix-reopened-on",
+        });
+        expect(reopened.outcome).toBe("start");
+        await stage.host.waitForRun(reopened.runId);
+
+        // ready_for_review toggle on: the (already reviewed) head is not
+        // re-reviewed, but the toggle itself accepted the event. Push first
+        // so the event targets a fresh head.
+        const pushed = pushNextCommit();
+        stage.pull.headSha = pushed;
+        const ready = await stage.host.handlePullRequestEvent({
+          action: "ready_for_review",
+          repository: "example/widgets",
+          pullNumber: 7,
+          sender: "octocat",
+          deliveryKey: "matrix-ready-on",
+        });
+        expect(ready.outcome).toBe("start");
+        await stage.host.waitForRun(ready.runId);
+
+        const runs = await runsOf(stage.host);
+        expect(runs).toHaveLength(2);
+        expect(runs.map((r) => r.subject.headSha)).toEqual([repo.headSha, pushed]);
+      },
+    );
+  });
+
+  it("refuses an automatic event on a closed pull request with a skipped check", async () => {
+    await withStage(
+      {
+        primaryScript: [],
+        reReviewScript: [],
+        autoMode: automaticPreset(),
+        pull: { state: "closed" as const },
+      },
+      async (stage) => {
+        const refused = await stage.host.handlePullRequestEvent({
+          action: "opened",
+          repository: "example/widgets",
+          pullNumber: 7,
+          sender: "octocat",
+          deliveryKey: "closed-auto-1",
+        });
+        expect(refused.outcome).toBe("refused");
+        expect(refused.refused).toContain("closed");
+        const refusalChecks = stage.fake.state.checks.filter((c) => c.headSha === repo.headSha);
+        expect(refusalChecks.at(-1)).toMatchObject({ state: "skipped" });
+        expect(await runsOf(stage.host)).toHaveLength(0);
+        expect(stage.fake.publishedReviews(7)).toHaveLength(0);
+      },
+    );
+  });
+
+  it("refuses redelivery of the same pull-request event: at most one automatic run", async () => {
+    await withStage(
+      {
+        primaryScript: [NO_FINDINGS_PRIMARY[0]!],
+        reReviewScript: [NO_FINDINGS_REREVIEW[0]!],
+        autoMode: { mode: "automatic", events: { opened: false, reopened: false, synchronize: true, readyForReview: false } },
+      },
+      async (stage) => {
+        // The first delivery starts the automatic review; re-delivering the
+        // SAME event (GitHub retry) is a duplicate and starts nothing.
+        const first = await stage.host.handlePullRequestEvent({
+          action: "synchronize",
+          repository: "example/widgets",
+          pullNumber: 7,
+          sender: "octocat",
+          deliveryKey: "pr-event-delivery-1",
+        });
+        expect(first.outcome).toBe("start");
+        await stage.host.waitForRun(first.runId);
+
+        const replay = await stage.host.handlePullRequestEvent({
+          action: "synchronize",
+          repository: "example/widgets",
+          pullNumber: 7,
+          sender: "octocat",
+          deliveryKey: "pr-event-delivery-1",
+        });
+        expect(replay.outcome).toBe("duplicate");
+        expect(await runsOf(stage.host)).toHaveLength(1);
+        expect(stage.fake.publishedReviews(7)).toHaveLength(1);
+      },
+    );
+  });
 });
 
 describe("scenario: pending requests and named checks", () => {
-  it("a /review on a newer head queues behind the active run and starts after it", async () => {
-    // Run A reads a file first (stays active); a command for the same head is
-    // satisfied, a command for a newer head queues.
+  it("redelivery of a queued /review does not start a second run after the queued run finishes", async () => {
+    // Writer's /review on head B queues behind run A; the drain runs it; a
+    // GitHub redelivery of the SAME comment must not start it again.
     const slowPrimary: StubScript = [
       { toolCall: { id: "call-slow", name: "read", input: JSON.stringify({ path: "src/handler.ts" }) } },
       { text: ["No issues found."], finishReason: "stop" as const, usage: { promptTokens: 100, completionTokens: 10 } },
@@ -525,88 +639,225 @@ describe("scenario: pending requests and named checks", () => {
           repository: "example/widgets",
           pullNumber: 7,
           requester: "octocat",
-          deliveryKey: "queue-command-1",
+          deliveryKey: "queued-redelivery-1",
         });
-
-        // Same-head command while the run is active: satisfied, no second run.
-        const sameHead = await stage.host.handleReviewCommand({
-          repository: "example/widgets",
-          pullNumber: 7,
-          requester: "octocat",
-          deliveryKey: "queue-command-2",
-        });
-        expect(sameHead.outcome).toBe("satisfied");
-        expect(sameHead.runId).toBe(first.runId);
-
-        // The PR pushes to a new head; the writer's command approves and queues.
         const pushed = pushNextCommit();
         stage.pull.headSha = pushed;
         const queued = await stage.host.handleReviewCommand({
           repository: "example/widgets",
           pullNumber: 7,
           requester: "octocat",
-          deliveryKey: "queue-command-3",
+          deliveryKey: "queued-redelivery-2",
         });
         expect(queued.outcome).toBe("queued");
-        expect(queued.runId).toBe("");
 
-        // The queued request starts after the active run finishes.
+        // Run A finishes; the queued request starts (records its delivery key).
         await stage.host.waitForRun(first.runId);
-        const second = await waitFor(() =>
+        await waitFor(() =>
           stage.host
             .runHistory()
             .allRuns({} as never)
-            .then((runs) => runs.find((r) => r.subject.headSha === pushed && r.checkStatus !== "in progress")),
+            .then((runs) => runs.find((r) => r.subject.headSha === pushed && r.checkStatus === "success")),
         );
-        expect(second.source).toBe("command");
+
+        // Redelivery of the queued comment: duplicate, no third run.
+        const replay = await stage.host.handleReviewCommand({
+          repository: "example/widgets",
+          pullNumber: 7,
+          requester: "octocat",
+          deliveryKey: "queued-redelivery-2",
+        });
+        expect(replay.outcome).toBe("duplicate");
+        expect(await runsOf(stage.host)).toHaveLength(2);
         expect(stage.fake.publishedReviews(7)).toHaveLength(2);
       },
     );
   });
 
-  it("an automatic review waits until the named checks have completed on the head", async () => {
-    await withStage(
-      {
-        primaryScript: [NO_FINDINGS_PRIMARY[0]!],
-        reReviewScript: [NO_FINDINGS_REREVIEW[0]!],
-        autoMode: {
-          mode: "automatic",
-          events: { opened: false, reopened: false, synchronize: true, readyForReview: false },
-          waitForChecks: ["lint"],
+  it("fork approvals and delivery dedup survive a host restart", async () => {
+    const sqliteFile = join(workspace, `restart-approval-${Math.random().toString(36).slice(2)}.sqlite`);
+    const pull: FakePullRequest = {
+      number: 7,
+      headSha: repo.headSha,
+      baseSha: repo.baseSha,
+      state: "open",
+      headRepo: "fork-owner/widgets",
+      baseRepo: "example/widgets",
+    };
+    const openHostOn = async (fake: FakeGitHub, primaryStub: ModelStub, reReviewStub: ModelStub) => {
+      const [primaryBase, reReviewBase, githubBase] = await Promise.all([
+        primaryStub.listen(), reReviewStub.listen(), fake.listen(),
+      ]);
+      return openReviewHost(
+        {
+          repository: "example/widgets",
+          pullNumber: 7,
+          githubToken: "t",
+          githubBaseUrl: githubBase,
+          primary: { baseUrl: `${primaryBase}/v1`, modelId: "stub-primary", apiKey: "k" },
+          reReview: { baseUrl: `${reReviewBase}/v1`, modelId: "stub-rereview", apiKey: "k" },
+          repositoryInstructions: "rules",
+          repositoryInstructionsRevision: repo.baseSha,
+          headCheckoutSource: repo.headCheckout(),
+          autoMode: {
+            mode: "automatic",
+            events: { opened: false, reopened: false, synchronize: true, readyForReview: false },
+          },
         },
-      },
-      async (stage) => {
-        // The named check has not started: the request stays pending, no run.
-        const queued = await stage.host.handlePullRequestEvent({
+        sqliteFile,
+      );
+    };
+
+    // Host A: the writer's /review approves the fork head and runs once.
+    const fakeA = new FakeGitHub([pull], ["src/handler.ts#RIGHT#3", "src/handler.ts#RIGHT#5"], { diffText: unifiedDiff() });
+    const stubA1 = new ModelStub([NO_FINDINGS_PRIMARY[0]!], "stub-primary");
+    const stubA2 = new ModelStub([NO_FINDINGS_REREVIEW[0]!], "stub-rereview");
+    {
+      const host = await openHostOn(fakeA, stubA1, stubA2);
+      try {
+        const command = await host.handleReviewCommand({
+          repository: "example/widgets",
+          pullNumber: 7,
+          requester: "octocat",
+          deliveryKey: "restart-command-1",
+        });
+        expect(command.outcome).toBe("start");
+        await host.waitForRun(command.runId);
+      } finally {
+        await host.close();
+        await fakeA.close();
+        stubA1.close();
+        stubA2.close();
+      }
+    }
+
+    // Host B on the same storage: the delivered key and the fork approval
+    // are enforced without re-running models.
+    const fakeB = new FakeGitHub([pull], ["src/handler.ts#RIGHT#3", "src/handler.ts#RIGHT#5"], { diffText: unifiedDiff() });
+    const stubB1 = new ModelStub([], "stub-primary");
+    const stubB2 = new ModelStub([], "stub-rereview");
+    try {
+      const host = await openHostOn(fakeB, stubB1, stubB2);
+      try {
+        // Redelivery of the command's comment: duplicate, no new run.
+        const replay = await host.handleReviewCommand({
+          repository: "example/widgets",
+          pullNumber: 7,
+          requester: "octocat",
+          deliveryKey: "restart-command-1",
+        });
+        expect(replay.outcome).toBe("duplicate");
+
+        // The approved fork head is still approved: an automatic event is not
+        // refused for approval, and not re-run (head already reviewed).
+        const auto = await host.handlePullRequestEvent({
+          action: "synchronize",
+          repository: "example/widgets",
+          pullNumber: 7,
+          sender: "fork-owner",
+          deliveryKey: "restart-sync-1",
+        });
+        expect(auto.outcome).toBe("ignored");
+        expect(auto.refused).toBeUndefined();
+
+        // The whole history survived the restart: exactly the one run.
+        expect(await host.runHistory().allRuns({} as never)).toHaveLength(1);
+        expect(fakeB.publishedReviews(7)).toHaveLength(0); // nothing new published
+      } finally {
+        await host.close();
+      }
+    } finally {
+      await fakeB.close();
+      stubB1.close();
+      stubB2.close();
+    }
+  });
+
+  it("a pending automatic request for named checks survives a host restart", async () => {
+    const sqliteFile = join(workspace, `restart-pending-${Math.random().toString(36).slice(2)}.sqlite`);
+    const pull: FakePullRequest = {
+      number: 7,
+      headSha: repo.headSha,
+      baseSha: repo.baseSha,
+      state: "open",
+    };
+    const openHostOn = async (fake: FakeGitHub, primaryStub: ModelStub, reReviewStub: ModelStub) => {
+      const [primaryBase, reReviewBase, githubBase] = await Promise.all([
+        primaryStub.listen(), reReviewStub.listen(), fake.listen(),
+      ]);
+      return openReviewHost(
+        {
+          repository: "example/widgets",
+          pullNumber: 7,
+          githubToken: "t",
+          githubBaseUrl: githubBase,
+          primary: { baseUrl: `${primaryBase}/v1`, modelId: "stub-primary", apiKey: "k" },
+          reReview: { baseUrl: `${reReviewBase}/v1`, modelId: "stub-rereview", apiKey: "k" },
+          repositoryInstructions: "rules",
+          repositoryInstructionsRevision: repo.baseSha,
+          headCheckoutSource: repo.headCheckout(),
+          autoMode: {
+            mode: "automatic",
+            events: { opened: false, reopened: false, synchronize: true, readyForReview: false },
+            waitForChecks: ["lint"],
+          },
+        },
+        sqliteFile,
+      );
+    };
+
+    // Host A: the automatic request queues for the named check and stays
+    // pending across close() (the drain never sees the check complete).
+    const fakeA = new FakeGitHub([pull], ["src/handler.ts#RIGHT#3", "src/handler.ts#RIGHT#5"], { diffText: unifiedDiff() });
+    const stubA1 = new ModelStub([], "stub-primary");
+    const stubA2 = new ModelStub([], "stub-rereview");
+    {
+      const host = await openHostOn(fakeA, stubA1, stubA2);
+      try {
+        const queued = await host.handlePullRequestEvent({
           action: "synchronize",
           repository: "example/widgets",
           pullNumber: 7,
           sender: "octocat",
-          deliveryKey: "checks-sync-1",
+          deliveryKey: "restart-sync-pending",
         });
         expect(queued.outcome).toBe("queued");
-        await new Promise((resolve) => setTimeout(resolve, 400));
-        expect(await runsOf(stage.host)).toHaveLength(0);
-
-        // The check runs (in progress) — still waiting.
-        stage.fake.state.externalChecks.set(`${repo.headSha}|lint`, "in_progress");
         await new Promise((resolve) => setTimeout(resolve, 200));
-        expect(await runsOf(stage.host)).toHaveLength(0);
+        expect(await host.runHistory().allRuns({} as never)).toHaveLength(0);
+      } finally {
+        await host.close(); // abandons the polling drain; pending stays durable
+        await fakeA.close();
+        stubA1.close();
+        stubA2.close();
+      }
+    }
 
-        // The check completes: the review starts on its own.
-        stage.fake.state.externalChecks.set(`${repo.headSha}|lint`, "completed:success");
-        // Wait for terminal durable state (the run may finish before we look).
+    // Host B on the same storage: the check completes; the recovered request
+    // starts on its own through drainPendingRequests().
+    const fakeB = new FakeGitHub([pull], ["src/handler.ts#RIGHT#3", "src/handler.ts#RIGHT#5"], { diffText: unifiedDiff() });
+    const stubB1 = new ModelStub([NO_FINDINGS_PRIMARY[0]!], "stub-primary");
+    const stubB2 = new ModelStub([NO_FINDINGS_REREVIEW[0]!], "stub-rereview");
+    try {
+      const host = await openHostOn(fakeB, stubB1, stubB2);
+      try {
+        fakeB.state.externalChecks.set(`${repo.headSha}|lint`, "completed:success");
+        await host.drainPendingRequests();
         const run = await waitFor(() =>
-          stage.host
+          host
             .runHistory()
             .allRuns({} as never)
-            .then((runs) =>
-              runs.find((r) => r.subject.headSha === repo.headSha && r.checkStatus === "success"),
-            ),
+            .then((runs) => runs.find((r) => r.subject.headSha === repo.headSha && r.checkStatus === "success")),
         );
-        expect(run.phase).toBe("published");
-        expect(stage.fake.publishedReviews(7)).toHaveLength(1);
-      },
-    );
+        expect(run.runId).toBeTruthy();
+        expect(run.source).toBe("automatic");
+        expect(fakeB.publishedReviews(7)).toHaveLength(1);
+      } finally {
+        await host.close();
+      }
+    } finally {
+      await fakeB.close();
+      stubB1.close();
+      stubB2.close();
+    }
   });
 });

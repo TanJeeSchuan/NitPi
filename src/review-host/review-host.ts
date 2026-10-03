@@ -254,6 +254,10 @@ class ReviewHostImpl implements ReviewHost {
       case "ignored":
         return { runId: "", conversationId: "", outcome: "ignored" };
       case "refused": {
+        // Every refusal carries a reason and never starts a run; refusals are
+        // deliberately re-evaluated on redelivery (state may have changed:
+        // draft became ready, permission was granted), at the cost of one
+        // refusal check per delivery. No AC violation — see the review note.
         await this.recordRefusal(event, evaluation);
         return { runId: "", refused: evaluation.reason, conversationId: "", outcome: "refused" };
       }
@@ -302,11 +306,16 @@ class ReviewHostImpl implements ReviewHost {
 
   /**
    * Bounded poll loop over the PR's pending request. Between attempts it
-   * sleeps `DRAIN_POLL_MS`, so a named-check wait or a finishing run can
-   * make a request startable; the pending request itself stays durable when
-   * the attempts run out, for a later trigger or host run.
+   * sleeps with capped exponential backoff (from `DRAIN_POLL_MS` up to
+   * `DRAIN_POLL_MAX_MS`), so a named-check wait — CI checks run for
+   * minutes — or a finishing run can make a request startable. When the
+   * attempts run out the loop exits but the pending request itself stays
+   * durable: the workflow (ticket 11) re-kicks the drain on `check_run`
+   * completion events and on every later trigger, and a host restart serves
+   * the request through `drainPendingRequests()`.
    */
   private async drainLoop(repository: string, pullNumber: number): Promise<void> {
+    let deferredStreak = 0;
     for (let attempt = 0; attempt < DRAIN_MAX_ATTEMPTS; attempt++) {
       // Outside the chain: wait out any active run of this pull request.
       const activePromises: Promise<void>[] = [];
@@ -322,7 +331,7 @@ class ReviewHostImpl implements ReviewHost {
       }
       if (activePromises.length > 0) {
         await Promise.allSettled(activePromises);
-        continue;
+        continue; // run finished; the loop re-checks at full speed
       }
       const decided = await this.enqueue(repository, pullNumber, () =>
         this.evaluateAndStartPending(repository, pullNumber),
@@ -333,7 +342,9 @@ class ReviewHostImpl implements ReviewHost {
         return;
       }
       if (decided === "deferred") {
-        await sleep(DRAIN_POLL_MS);
+        // Capped backoff across consecutive deferrals; the streak resets on
+        // every fresh drain loop (kicked by any trigger or run completion).
+        await sleep(Math.min(DRAIN_POLL_MAX_MS, DRAIN_POLL_MS * 2 ** Math.min(deferredStreak++, 8)));
         continue;
       }
       return; // nothing pending, or refused/ignored: the loop is done
@@ -547,20 +558,26 @@ class ReviewHostImpl implements ReviewHost {
   }
 
   async close(): Promise<void> {
+    // Active runs are awaited to their terminal state; drain loops are
+    // abandoned, not awaited — their pending requests stay durable (nitpi.gate)
+    // and a later trigger or `drainPendingRequests()` on a reopened host serves
+    // them. close() must not camp on a named-check wait.
     const pending = [...this.activeRuns.values()];
     this.activeRuns.clear();
     await Promise.allSettled(pending);
-    const draining = [...this.draining.values()];
+    for (const [, loop] of this.draining) void loop.catch(() => undefined);
     this.draining.clear();
-    await Promise.allSettled(draining);
     await this.harness.close(TODO_CONTEXT);
   }
 }
 
 const DRAIN_POLL_MS = 100;
-/** Bounded: a pending request that never becomes startable stops the loop
- * after ~12s of polling (100ms × 120); it stays durable for a later run. */
-const DRAIN_MAX_ATTEMPTS = 120;
+const DRAIN_POLL_MAX_MS = 5000;
+/** Bounded: 80 attempts with capped backoff camp on a pending request for
+ * roughly five minutes before the loop exits — the request itself stays
+ * durable and is re-kicked by later triggers, check_run completions (ticket
+ * 11 wiring) or a host restart. The bound keeps `close()` finite. */
+const DRAIN_MAX_ATTEMPTS = 80;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
