@@ -23,7 +23,14 @@ export interface GitHubApi {
       commit_id: string;
       event: "COMMENT";
       body: string;
-      comments: Array<{ path: string; side: "LEFT" | "RIGHT"; line: number; body: string }>;
+      comments: Array<{
+        path: string;
+        side: "LEFT" | "RIGHT";
+        line: number;
+        start_side?: "LEFT" | "RIGHT";
+        start_line?: number;
+        body: string;
+      }>;
     },
     signal?: AbortSignal,
   ): Promise<{ status: number; body: unknown }>;
@@ -45,6 +52,11 @@ export interface GitHubApi {
     repository: string,
     username: string,
   ): Promise<{ status: number; body: unknown }>;
+  /**
+   * The pull request's unified diff (base→head), the pinned diff anchor
+   * validation checks against (ticket 02). Served with the `diff` media type.
+   */
+  getPullRequestDiff(repository: string, pullNumber: number): Promise<{ status: number; body: string }>;
 }
 
 export interface PublishedResult {
@@ -111,6 +123,9 @@ export class Publisher {
           path: f.path,
           side: f.side,
           line: f.line,
+          ...(f.startSide !== undefined && f.startLine !== undefined
+            ? { start_side: f.startSide, start_line: f.startLine }
+            : {}),
           body: f.section,
         })),
       },

@@ -56,6 +56,11 @@ export interface RunDocument {
   finalReview?: string;
   auditNotes?: string;
   findings?: ReviewFinding[];
+  /** Correction rounds sent back to the re-reviewer for invalid anchors. */
+  anchorRounds?: number;
+  /** The reviewed base→head diff, fetched once at run start; anchor
+   *  validation checks against this text even if the PR later moves. */
+  pinnedDiff?: string;
   reReviewConversationId?: string;
   publication?: { reviewId: number; commentIds: number[] };
   /** The instructions each stage actually used, by content hash. */

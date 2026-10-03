@@ -77,3 +77,27 @@ export function createGitRepoFixture(): GitRepoFixture {
     },
   };
 }
+
+/**
+ * The unified diff of the fixture's base→head change, as GitHub would serve
+ * it for the pull request (the base and head live in separate repositories,
+ * so the text is written to mirror the committed contents exactly).
+ */
+export function unifiedDiff(): string {
+  return [
+    "diff --git a/src/handler.ts b/src/handler.ts",
+    "index 0000000..1111111 100644",
+    "--- a/src/handler.ts",
+    "+++ b/src/handler.ts",
+    "@@ -1,3 +1,8 @@",
+    " export function handler(input: string): string {",
+    "-  return input.trim();",
+    "+  const parts = input.split(',');",
+    "+  let result = '';",
+    "+  for (const part of parts) {",
+    "+    result += part.trim().toUpperCase() + ' ';",
+    "+  }",
+    "+  return result.trim();",
+    " }",
+  ].join("\n");
+}

@@ -2,13 +2,16 @@
  * Parsing of the final review Markdown into publishable findings.
  *
  * The re-reviewer's contract (instructions.ts) fixes one finding per section
- * with an inline location `path | LEFT/RIGHT | line`. This parser derives the
+ * with an inline location `path | LEFT/RIGHT | line`, or for a range
+ * `path | LEFT/RIGHT | line | LEFT/RIGHT | startLine` (the range ends at
+ * side/line and starts at startSide/startLine, mirroring GitHub's
+ * `line`/`side` plus `start_line`/`start_side`). This parser derives the
  * publisher's anchors from the Markdown; the Markdown remains the source of
  * truth and nothing becomes a second source of truth.
  *
- * Ticket 01 assumes every inline anchor is valid; validation lands in ticket
- * 02. A labeled finding section without an inline location is a parse error,
- * not a silent drop.
+ * Ticket 01 assumed every inline anchor is valid; ticket 02 adds validation
+ * (anchor-validation.ts). A labeled finding section without an inline
+ * location is a parse error, not a silent drop.
  */
 export type DiffSide = "LEFT" | "RIGHT";
 
@@ -21,6 +24,9 @@ export interface ReviewFinding {
   path: string;
   side: DiffSide;
   line: number;
+  /** Range start, present only when the location used the range form. */
+  startSide?: DiffSide;
+  startLine?: number;
 }
 
 export interface ParsedReview {
@@ -112,17 +118,44 @@ export interface InlineLocation {
   path: string;
   side: DiffSide;
   line: number;
+  /** Range start, present only in the five-segment range form. */
+  startSide?: DiffSide;
+  startLine?: number;
 }
 
-/** Parse `path | LEFT|RIGHT | line` (three segments, ` | ` separated). */
+/**
+ * Parse `path | LEFT|RIGHT | line` (three segments) or the range form
+ * `path | LEFT|RIGHT | line | LEFT|RIGHT | startLine` (five segments),
+ * ` | ` separated.
+ */
 export function parseLocation(line: string): InlineLocation | undefined {
   const parts = line.trim().split("|").map((p) => p.trim());
-  if (parts.length !== 3) return undefined;
-  const [path, side, lineRaw] = parts;
-  if (!path || !side || !lineRaw) return undefined;
-  if (side !== "LEFT" && side !== "RIGHT") return undefined;
-  if (!/^\d+$/.test(lineRaw)) return undefined;
-  const lineNumber = Number.parseInt(lineRaw, 10);
-  if (lineNumber < 1) return undefined;
-  return { path, side, line: lineNumber };
+  if (parts.length === 3) {
+    const [path, side, lineRaw] = parts;
+    if (!path || !side || !lineRaw) return undefined;
+    if (!isSide(side) || !isPositiveInt(lineRaw)) return undefined;
+    return { path, side, line: Number.parseInt(lineRaw, 10) };
+  }
+  if (parts.length === 5) {
+    const [path, side, lineRaw, startSide, startLineRaw] = parts;
+    if (!path || !side || !lineRaw || !startSide || !startLineRaw) return undefined;
+    if (!isSide(side) || !isPositiveInt(lineRaw)) return undefined;
+    if (!isSide(startSide) || !isPositiveInt(startLineRaw)) return undefined;
+    return {
+      path,
+      side,
+      line: Number.parseInt(lineRaw, 10),
+      startSide,
+      startLine: Number.parseInt(startLineRaw, 10),
+    };
+  }
+  return undefined;
+}
+
+function isSide(value: string): value is DiffSide {
+  return value === "LEFT" || value === "RIGHT";
+}
+
+function isPositiveInt(value: string): boolean {
+  return /^\d+$/.test(value) && Number.parseInt(value, 10) >= 1;
 }
