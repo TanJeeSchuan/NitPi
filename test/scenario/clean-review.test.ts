@@ -342,8 +342,10 @@ describe("scenario: /review clean runs a review without prior context (ticket 07
       const [c1, c2] = run1.publication!.commentIds as [number, number];
 
       // Clean run: F1 matches run 1's thread; F2 needs a fresh comment, and
-      // the fake swallows that POST — publication fails after the import.
-      stage.fake.state.dropNextWrite = { match: /comments$/, remaining: 1 };
+      // GitHub refuses that POST with a permission error — a known
+      // publication failure (ticket 05) that no retry or reconciliation can
+      // clear; publication fails after the import.
+      stage.fake.state.refuseNextWrite = { match: /comments$/, remaining: 1, status: 403, message: "Resource not accessible by integration" };
       scriptCleanRun(stage, `F1 -> ${c1}\nF2 -> none\n`);
       await expect(runReview(stage, "/review clean")).rejects.toThrow();
 

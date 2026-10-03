@@ -120,3 +120,11 @@ export function lastUserMessage(messages: RecordedMessages): string {
   const user = messages ? [...messages].reverse().find((m) => m.role === "user") : undefined;
   return typeof user?.content === "string" ? user.content : "";
 }
+
+/** Strip ticket 05's publisher-owned marker comments from a body, so tests
+ * comparing published bodies to frozen review sections stay marker-blind. */
+export function withoutPublishMarkers(body: string): string {
+  return body
+    .replace(/\n*<!-- nitpi:[^>]*? -->\n*/g, "\n")
+    .replace(/\n+$/g, "");
+}

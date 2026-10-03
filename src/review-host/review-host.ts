@@ -66,6 +66,7 @@ import {
   type ReviewRunRequest,
   type ReviewTaskDeps,
 } from "./review-task.js";
+import { publicationTask } from "../github/publication-task.js";
 import type { StageInstructionsRecord } from "./run-history.js";
 
 export { StorageInUse, CheckoutError };
@@ -175,7 +176,7 @@ export async function openReviewHost(
 
   const registry = createRegistry<ToolRegistration>();
   registry.install(CodingTools);
-  registry.install({ name: "nitpi-review", tools: [], sections: [], tasks: [reviewTask], hooks: [], wraps: [] });
+  registry.install({ name: "nitpi-review", tools: [], sections: [], tasks: [reviewTask, publicationTask], hooks: [], wraps: [] });
 
   const harness = await Harness.open(
     storage,
@@ -200,6 +201,7 @@ export async function openReviewHost(
     runHistory,
     api: new RestGitHubApi(config.githubBaseUrl, config.githubToken),
     stageDeadline: (stage) => (stage === "primary" ? config.primaryDeadlineMs : config.reReviewDeadlineMs),
+    ...(config.publicationSleep ? { publicationSleep: config.publicationSleep } : {}),
   };
   installReviewTaskDeps(deps);
   // Reopen recovery: interrupted tasks resume from their last checkpoint.

@@ -32,6 +32,8 @@ export interface ScenarioJarOptions {
   reReviewScript: StubScript;
   /** Reviewer stage deadlines in ms; defaults are generous. */
   deadlines?: { primaryMs?: number; reReviewMs?: number };
+  /** Test seam (ticket 05): publication rate-limit pacing recorder. */
+  publicationSleep?: (ms: number) => Promise<void>;
 }
 
 export interface ScenarioJar {
@@ -89,6 +91,7 @@ export async function openScenarioJar(options: ScenarioJarOptions): Promise<Scen
       storage: { baseUrl: state.service.url, authToken: "scenario-storage-token" },
       primaryDeadlineMs: options.deadlines?.primaryMs ?? 120_000,
       reReviewDeadlineMs: options.deadlines?.reReviewMs ?? 120_000,
+      ...(options.publicationSleep ? { publicationSleep: options.publicationSleep } : {}),
       primary: {
         baseUrl: `${primaryBase}/v1`,
         modelId: "stub-scenario-primary",

@@ -98,6 +98,12 @@ export interface ReviewHostConfig {
   /** Manual (default) or automatic trigger mode with its event toggles. */
   readonly autoMode?: AutoModeConfig;
   /**
+   * Test seam (ticket 05): pacing for publication's rate-limit waits.
+   * Production omits it and the publication task uses the durable runtime
+   * clock; tests inject a recording clock so the suite never really sleeps.
+   */
+  readonly publicationSleep?: (ms: number) => Promise<void>;
+  /**
    * Refused triggers surface on GitHub as check runs (skipped or action
    * required, with the explanation). "none" suppresses them entirely.
    */
