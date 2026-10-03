@@ -1,0 +1,29 @@
+{
+  "name": "nitpi-reviewer",
+  "version": "0.1.0",
+  "description": "Two-stage GitHub PR reviewer on Pi Durable (ticket 01 tracer)",
+  "main": "index.js",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "UNLICENSED",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3"
+  },
+  "dependencies": {
+    "@ai-sdk/openai-compatible": "^3.0.62",
+    "@earendil-works/chord": "^1.0.0",
+    "@earendil-works/pi-ai": "^1.0.0",
+    "@earendil-works/pi-durable": "^1.0.0",
+    "ai": "^7.0.127",
+    "zod": "^4.6.5"
+  }
+}
