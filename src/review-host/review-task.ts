@@ -4,24 +4,52 @@
  * Phases (pipeline, spec "Pi Durable mapping"):
  *   primary → freeze artifact → re-review → final frozen → publish → published
  *
- * Instructions per stage come from the resolved protocol + policy + repository
- * layers (instructions.ts). The primary turn runs in the canonical PR
- * conversation; the re-reviewer runs in a fresh task-owned conversation
- * created by this task with explicit agent configuration, on its own unchanged
- * checkout. It receives the frozen artifact plus repository and PR inputs —
- * never the primary transcript. After the final review is frozen, one more
- * matching-only turn in that same conversation assigns current findings to
- * earlier published comment IDs (ticket 04); the publisher then keeps the
- * pull request's threads in sync.
+ * Instructions per stage come from the resolved protocol + policy +
+ * repository layers (instructions.ts). The primary turn runs in the canonical
+ * PR conversation; the re-reviewer runs in a task-owned conversation (reused
+ * when an interrupted attempt already recorded one) with explicit agent
+ * configuration, on its own unchanged checkout. It receives the frozen
+ * artifact plus repository and PR inputs — never the primary transcript.
+ * After the final review is frozen, one more matching-only turn in that same
+ * conversation assigns current findings to earlier published comment IDs
+ * (ticket 04); the publisher then keeps the pull request's threads in sync.
+ *
+ * Recovery (ticket 06): the task's checkpoint is the pipeline phase. On
+ * reopen (an Actions re-run) a surviving run resumes from its last durable
+ * checkpoint, and the run document itself decides what is already durable:
+ * a frozen artifact means the re-review stage; a frozen final review means
+ * matching, and a recorded match means publication. After a completed primary stage, no new primary model calls
+ * happen — the canonical conversation's transcript is the durable primary
+ * work, and a mid-stage attempt continues it instead of starting over. When
+ * the runner itself is killed (host signal, close, job cancel), the
+ * interrupted attempt records nothing: the durable checkpoint stands and no
+ * failure handling fires.
+ *
+ * Failure handling: if either reviewer errors or exceeds its deadline, no
+ * findings are published. The check reports failure (error) or incomplete
+ * (timeout) with a reason, and the durable work stays recorded on the run
+ * document for a re-run. If storage is unreachable, the phase stops with an
+ * execution failure: no local continuation, no publication.
+ *
+ * Anchor validation (ticket 02) stays on the frozen-artifact flow: the
+ * final review freezes only once every remaining anchor is valid against
+ * the pinned diff, with correction rounds inside the re-review conversation.
  *
  * Module dependencies (`installReviewTaskDeps`) exist because pi-durable
  * resolves task definitions from the registry at invocation: the process-wide
  * host wires registry + publisher once before the harness starts work.
+ *
+ * Deliberate cohesion: this module is the pipeline state machine, so the
+ * recovery contract's deadlines (StageTimeout), resume positioning
+ * (initialPhase), strict-JSON usage recording, and anchor-round carry-over
+ * all live here — they are one durable phase-advance behavior, not unrelated
+ * reasons (the code-review question is answered by the phase boundaries
+ * each concern sits behind).
  */
 import type { Context } from "@earendil-works/chord";
 import { TODO_CONTEXT } from "@earendil-works/chord/context";
 import { createHash } from "node:crypto";
-import type { Conversation, Harness } from "@earendil-works/pi-durable";
+import type { Conversation, Harness, Submission, TaskRuntime } from "@earendil-works/pi-durable";
 import { defineTask } from "@earendil-works/pi-durable";
 import { Publisher, PublishError } from "../github/publisher.js";
 import type { GitHubApi } from "../github/publisher.js";
@@ -39,7 +67,7 @@ import {
 } from "./matching.js";
 import type { ReviewHostConfig } from "./config.js";
 import type { ResolvedInstructions } from "./instructions.js";
-import type { RunDocument, RunHistory, RunPhase, StageUsage } from "./run-history.js";
+import type { RunDocument, RunHistory, RunPhase, RunUsage, StageUsage } from "./run-history.js";
 
 export interface ReviewRunRequest {
   readonly repository: string;
@@ -60,6 +88,8 @@ export interface ReviewTaskDeps {
   readonly runHistory: RunHistory;
   readonly api: GitHubApi;
   getInstructions(role: "primary" | "re-review"): ResolvedInstructions;
+  /** Duration in milliseconds after which a stage fails as incomplete. */
+  stageDeadline(stage: "primary" | "re-review"): number;
 }
 
 let deps: ReviewTaskDeps | undefined;
@@ -77,6 +107,12 @@ export interface ReviewTaskInput {
   readonly runId: string;
   readonly canonicalConversationId: string;
   readonly request: ReviewRunRequest;
+  /**
+   * First checkpoint of this task. Fresh runs start the primary; a re-run
+   * resuming a failed attempt starts where the run document's durable
+   * already-completed work is (re-review or publish).
+   */
+  readonly initialPhase?: "primary" | "re-review" | "match" | "publish";
 }
 
 export interface ReviewCheckpoint {
@@ -90,7 +126,7 @@ export type ReviewTaskResult =
 export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTaskResult, object>({
   name: "nitpi.review",
   version: 1,
-  initial: () => ({ phase: "primary" as const }),
+  initial: (input) => ({ phase: input.initialPhase ?? ("primary" as const) }),
   phases: {
     primary: async (task, runtime, context) => {
       try {
@@ -98,6 +134,14 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
         const runDoc = await host.runHistory.findRun(task.input.runId, context);
         if (!runDoc) throw new Error(`run ${task.input.runId} is not recorded`);
         const canonical = await harnessConversation(host.runHistory.harness, task.input.canonicalConversationId);
+
+        // Cross-commit boundary recovery: the artifact froze but the task
+        // still points at the primary phase → primary model work is done and
+        // must not run again; continue with the re-review stage.
+        if (runDoc.artifactFrozen && runDoc.artifact) {
+          await advancePhase(runtime, context, "re-review");
+          return;
+        }
 
         // Primary instructions: protocol + policy + repository layers, with
         // the content hash recorded on the run document.
@@ -113,16 +157,21 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
 
         // Pin the reviewed base→head diff once, at run start: anchor
         // validation (ticket 02) checks against THIS text even if the pull
-        // request's head moves while the review runs.
-        const pinnedDiff = await readPinnedDiff(host, runDoc.subject);
-        await commitRunUpdate(host, task.input.runId, context, (run) => ({
-          ...run,
-          pinnedDiff,
-        }));
+        // request's head moves while the review runs. A resumed attempt
+        // reuses the first attempt's pin: the pin is per-run durable state.
+        if (!runDoc.pinnedDiff?.trim()) {
+          const pinnedDiff = await readPinnedDiff(host, runDoc.subject);
+          await commitRunUpdate(host, task.input.runId, context, (run) => ({
+            ...run,
+            pinnedDiff,
+          }));
+        }
 
         // Primary turn: one prompt, run to completion, Pi keeps the tool loop.
+        // A resumed attempt continues the canonical conversation's earlier
+        // work instead of restarting it from scratch.
         const prompt = buildPrimaryPrompt(runDoc);
-        await runConversationTurn(canonical, prompt, context);
+        await runConversationTurn(canonical, prompt, context, host, "primary");
 
         // Freeze the hand-off: stored unchanged as free-form text.
         const answer = await latestAssistant(canonical, context);
@@ -133,18 +182,13 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
           artifactFrozen: true,
           phase: "primary frozen",
           instructionHashes: { ...run.instructionHashes, primary: sha256(instructions.text) },
-          usage: { ...run.usage, primary: answer?.usageSummary },
+          usage: mergeUsage(run, "primary", answer?.usageSummary),
         }));
 
-        await runtime.commit(
-          (_tx, current) => ({
-            status: "running" as const,
-            checkpoint: { ...current.state.checkpoint, phase: "re-review" as const },
-          }),
-          context,
-        );
+        await advancePhase(runtime, context, "re-review");
       } catch (error) {
-        await failRun(task.input.runId, context, error);
+        if (isKilledInvocation(runtime)) return;
+        await failRun(task.input, context, error);
       }
     },
 
@@ -155,20 +199,39 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
         if (!runDoc) throw new Error(`run ${task.input.runId} is not recorded`);
         if (!runDoc.artifact) throw new Error("primary artifact is not frozen");
 
+        // Cross-commit boundary recovery: the final review froze but the task
+        // still points at re-review → go straight to matching (ticket 04),
+        // which runs before publication.
+        if (runDoc.finalReview) {
+          await advancePhase(runtime, context, "match");
+          return;
+        }
+
         // The check keeps showing the current stage while running.
         await new Publisher(host.api).checkInProgress(runDoc.subject, "re-review");
 
-        // Fresh task-owned conversation for the re-reviewer. The commit makes
-        // durable progress by creating the conversation; the task checkpoint
-        // changes at the phase boundary below.
-        let createdId: string | undefined;
-        await runtime.commit(async (tx) => {
-          const record = await tx.createConversation({
-            ownership: { kind: "task", taskId: runtime.taskId },
-          });
-          createdId = record.id as unknown as string;
-        }, context);
-        const conversation = await harnessConversation(host.runHistory.harness, createdId!);
+        // Task-owned conversation for the re-reviewer. A resumed attempt
+        // reuses its durable task-owned conversation when one was already
+        // recorded; a fresh attempt creates one. The commit makes durable
+        // progress; the task checkpoint changes at the phase boundary below.
+        let conversation: Conversation;
+        if (runDoc.reReviewConversationId) {
+          // The durable conversation carries the earlier re-review work: an
+          // interrupted attempt continues it instead of starting another one.
+          conversation = await harnessConversation(
+            host.runHistory.harness,
+            runDoc.reReviewConversationId,
+          );
+        } else {
+          let createdId: string | undefined;
+          await runtime.commit(async (tx) => {
+            const record = await tx.createConversation({
+              ownership: { kind: "task", taskId: runtime.taskId },
+            });
+            createdId = record.id as unknown as string;
+          }, context);
+          conversation = await harnessConversation(host.runHistory.harness, createdId!);
+        }
         const instructions = host.getInstructions("re-review");
         await configureConversation(
           conversation,
@@ -184,7 +247,7 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
         }));
 
         const prompt = buildReReviewPrompt(runDoc);
-        await runConversationTurn(conversation, prompt, context);
+        await runConversationTurn(conversation, prompt, context, host, "re-review");
 
         // Anchor validation against the pinned diff (ticket 02): the final
         // review freezes only once every remaining anchor is valid. An
@@ -198,7 +261,7 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
         let parsed = parseFinalReview(answer?.text ?? "");
         let previousLabels = parsed.findings.map((f) => f.label);
         let invalid = validateFindingAnchors(parsed.findings, anchors);
-        let anchorRounds = 0;
+        let anchorRounds = runDoc.anchorRounds ?? 0;
         while (invalid.length > 0) {
           if (anchorRounds >= MAX_ANCHOR_ROUNDS) {
             // The re-reviewer finished with an invalid anchor still in
@@ -215,7 +278,7 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
             ...run,
             anchorRounds,
           }));
-          await runConversationTurn(conversation, buildAnchorFeedbackPrompt(invalid), context);
+          await runConversationTurn(conversation, buildAnchorFeedbackPrompt(invalid), context, host, "re-review");
           answer = await latestAssistant(conversation, context);
           parsed = parseFinalReview(answer?.text ?? "");
           const currentLabels = parsed.findings.map((f) => f.label);
@@ -239,18 +302,12 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
           phase: "final frozen",
           anchorRounds,
           instructionHashes: { ...run.instructionHashes, reReview: sha256(instructions.text) },
-          usage: { ...run.usage, reReview: answer?.usageSummary },
+          usage: mergeUsage(run, "reReview", answer?.usageSummary),
         }));
 
-        await runtime.commit(
-          (_tx, current) => ({
-            status: "running" as const,
-            checkpoint: { ...current.state.checkpoint, phase: "match" as const },
-          }),
-          context,
-        );
+        await advancePhase(runtime, context, "match");
       } catch (error) {
-        await failRun(task.input.runId, context, error);
+        await failRun(task.input, context, error);
       }
     },
 
@@ -287,6 +344,8 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
             conversation,
             buildMatchPrompt(findings, matchableComments(earlier, botLogin)),
             context,
+            host,
+            "re-review",
           );
           const answer = await latestAssistant(conversation, context);
           matches.push(...parseMatchList(answer?.text ?? "", new Set(findings.map((f) => f.label))).matches);
@@ -305,15 +364,10 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
           ...(usage !== undefined ? { usage } : {}),
         }));
 
-        await runtime.commit(
-          (_tx, current) => ({
-            status: "running" as const,
-            checkpoint: { ...current.state.checkpoint, phase: "publish" as const },
-          }),
-          context,
-        );
+        await advancePhase(runtime, context, "publish");
       } catch (error) {
-        await failRun(task.input.runId, context, error);
+        if (isKilledInvocation(runtime)) return;
+        await failRun(task.input, context, error);
       }
     },
 
@@ -355,22 +409,22 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
           context,
         );
       } catch (error) {
-        const reason = error instanceof PublishError ? error.message : errorText(error);
-        await recordRunFailure(host, task.input.runId, context, reason, "publishing");
-        await runtime.commit(
-          (_tx) =>
-            ({
-              status: "terminal" as const,
-              outcome: { status: "failed" as const, error: { message: reason } },
-            }) as const,
-          context,
-        );
+        if (isKilledInvocation(runtime)) return; // A dead runner records nothing.
+        // Record the failure on the run document and GitHub. Storage being
+        // down must not itself turn into a crash here: the run doc update is
+        // best-effort, and the check still reports a reason.
+        await failRun(task.input, context, error);
       }
     },
   },
-  abort: async (_task, runtime, context) => {
+  abort: async (task, runtime, context) => {
     // Durable cancellation: nothing publishes after abort (ticket 09 refines
-    // the fence; v0 keeps the terminal marker).
+    // the fence). The run document already carries the stage's reason when
+    // this follows a failed stage; the check status flips to failure here.
+    await commitRunUpdateSafe(reviewTaskDeps(), task.input.runId, context, (run) => ({
+      ...run,
+      checkStatus: "failure",
+    }));
     await runtime.commit(
       (_tx) =>
         ({
@@ -385,41 +439,131 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
 
 // --- helpers ----------------------------------------------------------------
 
+class StageTimeout extends Error {
+  constructor(
+    readonly stage: "primary" | "re-review",
+    readonly deadlineMs: number,
+  ) {
+    super(`${stage} reviewer exceeded its ${deadlineMs}ms deadline`);
+    this.name = "StageTimeout";
+  }
+}
+
+/** Advance the pipeline to the next phase as one durable checkpoint. */
+async function advancePhase(
+  runtime: Pick<TaskRuntime<ReviewTaskInput, ReviewCheckpoint, ReviewTaskResult, object>, "commit">,
+  context: Context,
+  phase: "re-review" | "match" | "publish",
+): Promise<void> {
+  await runtime.commit(
+    (_tx, current) => ({
+      status: "running" as const,
+      checkpoint: { ...current.state.checkpoint, phase },
+    }),
+    context,
+  );
+}
+
+/** Merge this turn's usage into the run document (strict JSON: absent key,
+ * never an undefined value, when the turn produced no usage). */
+function mergeUsage(
+  run: RunDocument,
+  stage: keyof RunUsage,
+  next: TurnAnswer["usageSummary"] | undefined,
+): RunUsage {
+  const usage: RunUsage = { ...run.usage };
+  if (next) usage[stage] = next;
+  return usage;
+}
+
+/**
+ * The runner was killed (host signal, close, job cancel): nothing is recorded
+ * for this attempt — the crash semantics leave the durable checkpoint as it
+ * was, and the durable failure handling (reason, GitHub check) does not fire.
+ */
+function isKilledInvocation(runtime: { readonly signal: AbortSignal }): boolean {
+  return runtime.signal.aborted;
+}
+
+/**
+ * Run one reviewer turn up to the stage deadline. On deadline, abort the
+ * submission so the in-flight model work stops, and fail the stage as
+ * incomplete: no findings are published and the durable work is kept for a
+ * re-run.
+ */
+async function runConversationTurn(
+  conversation: Conversation,
+  prompt: string,
+  context: Context,
+  host: ReviewTaskDeps,
+  stage: "primary" | "re-review",
+): Promise<void> {
+  const deadlineMs = host.stageDeadline(stage);
+  const submission: Submission = await conversation.submit({ type: "input", content: prompt }, context);
+  let timer: NodeJS.Timeout | undefined;
+  let timedOut = false;
+  try {
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        reject(new StageTimeout(stage, deadlineMs));
+      }, deadlineMs);
+      timer.unref?.();
+    });
+    const settled = await Promise.race([submission.wait(context), deadline]);
+    if (settled.status === "unanswered") {
+      const detail = settled.detail === undefined ? undefined : String(settled.detail);
+      throw new Error(detail ?? `model turn did not answer (${settled.reason})`);
+    }
+  } catch (error) {
+    if (timedOut) {
+      // Stop the in-flight turn so no further model work happens for this
+      // stage; the durable conversation keeps what already ran.
+      await submission.abort(TODO_CONTEXT).catch(() => undefined);
+      throw new StageTimeout(stage, deadlineMs);
+    }
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /** Record a stage failure on the run document and GitHub, then rethrow so the
- * durable task faults with the reason. No provisional findings are published. */
+ * durable task faults with the reason. No provisional findings are published;
+ * the durable work stays for a re-run. Storage being unreachable degrades to
+ * an execution failure surfaced through the task: the subject comes from the
+ * durable task input, because storage being down may leave the run document
+ * unreadable while the check must still report. */
 async function failRun(
-  runId: string,
+  input: ReviewTaskInput,
   context: Context,
   error: unknown,
 ): Promise<never> {
+  const host = reviewTaskDeps();
   const reason = errorText(error);
-  await recordRunFailure(reviewTaskDeps(), runId, context, reason);
-  throw error instanceof Error ? error : new Error(reason);
-}
-
-/** Shared failure bookkeeping: GitHub check failure + run document update. */
-async function recordRunFailure(
-  host: ReviewTaskDeps,
-  runId: string,
-  context: Context,
-  reason: string,
-  phase?: RunPhase,
-): Promise<void> {
-  const runDoc = await host.runHistory.findRun(runId, context);
+  const subject: RunDocument["subject"] = {
+    repository: input.request.repository,
+    pullNumber: input.request.pullNumber,
+    baseSha: input.request.baseSha,
+    headSha: input.request.headSha,
+  };
+  const publisher = new Publisher(host.api);
   try {
-    if (runDoc) {
-      await new Publisher(host.api).checkFailure(runDoc.subject, reason);
+    if (error instanceof StageTimeout) {
+      await publisher.checkIncomplete(subject, reason);
+    } else {
+      await publisher.checkFailure(subject, reason);
     }
   } catch {
-    // checkFailure itself failing must not mask the original reason.
+    // The check failing must not mask the original reason.
   }
-  await commitRunUpdateSafe(host, runId, context, (run) => ({
+  await commitRunUpdateSafe(host, input.runId, context, (run) => ({
     ...run,
-    ...(phase ? { phase } : {}),
     checkStatus: "failure",
-    checkDetail: reason,
+    checkDetail: error instanceof StageTimeout ? `incomplete review: ${reason}` : reason,
     error: reason,
   }));
+  throw error instanceof Error ? error : new Error(reason);
 }
 
 async function commitRunUpdateSafe(
@@ -431,8 +575,8 @@ async function commitRunUpdateSafe(
   try {
     await commitRunUpdate(host, runId, context, mutate);
   } catch {
-    // If the run doc cannot be updated, the rethrow in the caller still
-    // surfaces the original failure through the task.
+    // With storage unreachable this is the execution failure itself; the
+    // rethrow path in the caller still surfaces it through the task.
   }
 }
 
@@ -454,15 +598,6 @@ async function configureConversation(
     { model: { provider, modelId }, instructions, ...(cwd ? { cwd } : {}) },
     context,
   );
-}
-
-async function runConversationTurn(conversation: Conversation, prompt: string, context: Context): Promise<void> {
-  const submission = await conversation.submit({ type: "input", content: prompt }, context);
-  const settled = await submission.wait(context);
-  if (settled.status === "unanswered") {
-    const detail = settled.detail === undefined ? undefined : String(settled.detail);
-    throw new Error(detail ?? `model turn did not answer (${settled.reason})`);
-  }
 }
 
 export interface TurnAnswer {
@@ -524,10 +659,14 @@ function sha256(text: string): string {
 }
 
 function buildPrimaryPrompt(run: RunDocument): string {
+  // A resumed attempt continues the canonical conversation: its transcript
+  // already holds the earlier inspect-and-draft work, so the prompt asks the
+  // reviewer to continue instead of starting over.
   return [
     `Review pull request #${run.subject.pullNumber} in repository ${run.subject.repository}.`,
     `Reviewed head: ${run.subject.headSha} (base: ${run.subject.baseSha}).`,
     `Mode: ${run.mode}. Use your tools on this checkout; do not push, commit or edit the pull request.`,
+    `Earlier turns in this conversation may already contain part of this review from an interrupted attempt; continue from there instead of starting over.`,
     `Finish with your free-form review artifact as your final assistant message.`,
   ].join("\n");
 }
@@ -563,8 +702,6 @@ function buildAnchorFeedbackPrompt(invalid: readonly InvalidAnchor[]): string {
   ].join("\n");
 }
 
-export const __testing = { buildPrimaryPrompt, buildReReviewPrompt, buildAnchorFeedbackPrompt };
-
 /** Read the pull request's base→head diff (the pinned diff), as GitHub serves it. */
 async function readPinnedDiff(
   host: ReviewTaskDeps,
@@ -581,3 +718,12 @@ async function readPinnedDiff(
 
 /** Correction rounds allowed before an unresolved anchor fails the run. */
 const MAX_ANCHOR_ROUNDS = 3;
+
+export const __testing = {
+  buildPrimaryPrompt,
+  buildReReviewPrompt,
+  buildAnchorFeedbackPrompt,
+  StageTimeout,
+};
+
+export type { RunPhase };

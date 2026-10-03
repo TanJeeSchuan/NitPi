@@ -52,6 +52,15 @@ export interface ReviewHostConfig {
   /** Repository slug, e.g. `owner/name`. */
   readonly repository: string;
   readonly pullNumber: number;
+  /**
+   * The storage service for durable state (ticket 06): runs on the homeserver
+   * and keeps this PR's partition of Pi's state in SQLite.
+   */
+  readonly storage: StorageEndpoint;
+  /** Primary reviewer deadline in ms; a timeout is an incomplete check. */
+  readonly primaryDeadlineMs: number;
+  /** Re-reviewer deadline in ms; a timeout is an incomplete check. */
+  readonly reReviewDeadlineMs: number;
   /** GitHub token with `pull-requests: write` for publication. */
   readonly githubToken: string;
   /** GitHub API base URL (fake in tests, `https://api.github.com` in CI). */
@@ -77,6 +86,13 @@ export interface ReviewHostConfig {
    * required, with the explanation). "none" suppresses them entirely.
    */
   readonly refusalCheckBehavior?: "as-refused" | "action_required" | "none";
+}
+
+export interface StorageEndpoint {
+  /** Storage service base URL, e.g. `http://homeserver:51733`. */
+  readonly baseUrl: string;
+  /** Storage bearer token (a GitHub secret in Actions). */
+  readonly authToken: string;
 }
 
 export class ConfigError extends Error {
@@ -125,6 +141,20 @@ export function resolveConfig(input: ReviewHostConfig): ReviewHostConfig {
   }
   if (!isFullSha(input.repositoryInstructionsRevision)) {
     throw new ConfigError("repositoryInstructionsRevision must be a full commit SHA");
+  }
+  if (!input.storage || !/^https?:\/\//.test(input.storage.baseUrl ?? "")) {
+    throw new ConfigError("storage.baseUrl must be an absolute http(s) URL (the storage service)");
+  }
+  if (!input.storage.authToken) {
+    throw new ConfigError("storage.authToken is required (GitHub secret)");
+  }
+  for (const [name, value] of [
+    ["primaryDeadlineMs", input.primaryDeadlineMs],
+    ["reReviewDeadlineMs", input.reReviewDeadlineMs],
+  ] as const) {
+    if (!Number.isFinite(value) || (value as number) <= 0) {
+      throw new ConfigError(`${name} must be a positive number of milliseconds`);
+    }
   }
   if (!input.headCheckoutSource) {
     throw new ConfigError("headCheckoutSource is required (the workflow's checked-out repository)");

@@ -29,7 +29,12 @@ export interface StubError {
   body: { error: { message: string; code?: string } };
 }
 
-export type StubScript = Array<StubTurn | StubError>;
+/** A request that never streams and never closes: for deadline scenarios. */
+export interface StubHang {
+  kind: "hang";
+}
+
+export type StubScript = Array<StubTurn | StubError | StubHang>;
 
 export interface RecordedRequest {
   body: {
@@ -87,6 +92,8 @@ export class ModelStub {
 
   async close(): Promise<void> {
     if (!this.server) return;
+    // Hung connections from deadline scenarios must not keep the test alive.
+    this.server.closeAllConnections();
     this.server.close();
     await once(this.server, "close");
     this.server = undefined;
@@ -108,6 +115,14 @@ export class ModelStub {
       response.statusCode = step.status;
       response.setHeader("content-type", "application/json");
       response.end(JSON.stringify(step.body));
+      return;
+    }
+    if (step.kind === "hang") {
+      // Stream headers then nothing: the client waits until its deadline or
+      // abort cancels the fetch.
+      response.statusCode = 200;
+      response.setHeader("content-type", "text/event-stream");
+      response.flushHeaders();
       return;
     }
     this.streamTurn(step, response);

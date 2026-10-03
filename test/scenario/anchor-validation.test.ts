@@ -12,22 +12,34 @@ import { join } from "node:path";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { openReviewHost, type ReviewHost } from "../../src/review-host/review-host.js";
+import {
+  startReviewStorageService,
+  type ReviewStorageService,
+} from "../../src/storage/service.js";
 import { FakeGitHub } from "../fixtures/fake-github.js";
 import { ModelStub, type StubScript } from "../fixtures/model-stub.js";
 import { createGitRepoFixture, unifiedDiff, type GitRepoFixture } from "../fixtures/git-fixture.js";
 
-let workspace: string;
+let storageDir: string;
 let repo: GitRepoFixture;
+let service: ReviewStorageService;
+/** Each scenario gets its own storage partition (repository stays fixed). */
+let nextPullNumber = 100;
 
 beforeAll(async () => {
-  workspace = mkdtempSync(join(tmpdir(), "nitpi-anchor-"));
+  storageDir = mkdtempSync(join(tmpdir(), "nitpi-anchor-storage-"));
   repo = createGitRepoFixture();
+  service = await startReviewStorageService({
+    dataDir: storageDir,
+    authToken: "anchor-storage-token",
+  });
 });
 
 afterAll(async () => {
   repo.dispose();
   try {
-    rmSync(workspace, { recursive: true, force: true });
+    await service.stop();
+    rmSync(storageDir, { recursive: true, force: true });
   } catch {
     // Windows can hold the SQLite file briefly after close; the OS temp dir
     // cleans up. Cleanup failure must not fail the suite.
@@ -131,11 +143,14 @@ interface Stage {
   host: ReviewHost;
   fake: FakeGitHub;
   reReviewStub: ModelStub;
+  pullNumber: number;
 }
 
 async function openScenario(reReviewScript: StubScript, onReReviewServe?: (index: number) => void): Promise<Stage> {
+  // Each scenario gets its own storage partition (repository stays fixed).
+  const pullNumber = ++nextPullNumber;
   const fake = new FakeGitHub(
-    [{ number: 7, headSha: repo.headSha, baseSha: repo.baseSha, state: "open" }],
+    [{ number: pullNumber, headSha: repo.headSha, baseSha: repo.baseSha, state: "open" }],
     [],
     { diffText: unifiedDiff() },
   );
@@ -149,18 +164,22 @@ async function openScenario(reReviewScript: StubScript, onReReviewServe?: (index
   const host = await openReviewHost(
     {
       repository: "example/widgets",
-      pullNumber: 7,
+      pullNumber,
       githubToken: "test-token",
       githubBaseUrl: githubBase,
+      // Ticket 06: durable state lives on the localhost storage service;
+      // each scenario opens its own partition (pull number).
+      storage: { baseUrl: service.url, authToken: "anchor-storage-token" },
+      primaryDeadlineMs: 120_000,
+      reReviewDeadlineMs: 120_000,
       primary: { baseUrl: `${primaryBase}/v1`, modelId: "stub-primary", apiKey: "stub-primary-key" },
       reReview: { baseUrl: `${reReviewBase}/v1`, modelId: "stub-rereview", apiKey: "stub-rereview-key" },
       repositoryInstructions: "Be strict about unused parameters.",
       repositoryInstructionsRevision: repo.baseSha,
       headCheckoutSource: repo.headCheckout(),
     },
-    join(workspace, `run-${Math.random().toString(36).slice(2)}.sqlite`),
   );
-  return { host, fake, reReviewStub };
+  return { host, fake, reReviewStub, pullNumber };
 }
 
 /** The newest user message of a recorded request (the resent history's last turn input). */
@@ -180,14 +199,14 @@ describe("scenario: anchor validation and correction", () => {
     try {
       const started = await stage.host.handleReviewCommand({
         repository: "example/widgets",
-        pullNumber: 7,
+        pullNumber: stage.pullNumber,
         requester: "octocat",
       });
       await stage.host.waitForRun(started.runId);
 
       // The corrected finding publishes at its corrected anchor (a range);
       // the valid finding publishes unchanged.
-      const review = stage.fake.publishedReviews(7).at(-1)!;
+      const review = stage.fake.publishedReviews(stage.pullNumber).at(-1)!;
       expect(review.event).toBe("COMMENT");
       expect(review.commitId).toBe(repo.headSha);
       expect(review.body).toContain("2 findings");
@@ -232,13 +251,13 @@ describe("scenario: anchor validation and correction", () => {
     try {
       const started = await stage.host.handleReviewCommand({
         repository: "example/widgets",
-        pullNumber: 7,
+        pullNumber: stage.pullNumber,
         requester: "octocat",
       });
       await stage.host.waitForRun(started.runId);
 
       // The withdrawn finding is not published: only F2's comment remains.
-      const review = stage.fake.publishedReviews(7).at(-1)!;
+      const review = stage.fake.publishedReviews(stage.pullNumber).at(-1)!;
       expect(review.comments).toHaveLength(1);
       expect(review.comments[0]).toMatchObject({ path: "src/handler.ts", side: "RIGHT", line: 5 });
       expect(review.comments[0]!.body).not.toContain("F1");
@@ -274,14 +293,14 @@ describe("scenario: anchor validation and correction", () => {
     try {
       const started = await stage.host.handleReviewCommand({
         repository: "example/widgets",
-        pullNumber: 7,
+        pullNumber: stage.pullNumber,
         requester: "octocat",
       });
       await expect(stage.host.waitForRun(started.runId)).rejects.toThrow(/F1.*RIGHT \| 98|RIGHT \| 98.*F1/s);
 
       // Nothing is published: no review, and the check is a failure — never
       // a zero-finding success.
-      expect(stage.fake.publishedReviews(7)).toHaveLength(0);
+      expect(stage.fake.publishedReviews(stage.pullNumber)).toHaveLength(0);
       const check = stage.fake.state.checks.at(-1)!;
       expect(check).toMatchObject({ state: "failure", headSha: repo.headSha });
       expect(check.summary).toContain("F1");
@@ -317,13 +336,13 @@ describe("scenario: anchor validation and correction", () => {
     try {
       const started = await stage.host.handleReviewCommand({
         repository: "example/widgets",
-        pullNumber: 7,
+        pullNumber: stage.pullNumber,
         requester: "octocat",
       });
       // F1's section vanished and the audit notes never mention it: the
       // withdrawal was not recorded, so the run fails and nothing publishes.
       await expect(stage.host.waitForRun(started.runId)).rejects.toThrow(/F1/);
-      expect(stage.fake.publishedReviews(7)).toHaveLength(0);
+      expect(stage.fake.publishedReviews(stage.pullNumber)).toHaveLength(0);
       expect(stage.fake.state.checks.at(-1)).toMatchObject({ state: "failure", headSha: repo.headSha });
     } finally {
       await stage.host.close();
@@ -352,14 +371,14 @@ describe("scenario: anchor validation and correction", () => {
     try {
       const started = await stage.host.handleReviewCommand({
         repository: "example/widgets",
-        pullNumber: 7,
+        pullNumber: stage.pullNumber,
         requester: "octocat",
       });
       await stage.host.waitForRun(started.runId);
 
       // The anchors of the PINNED diff (fetched during primary) validate and
       // publish; validation against the live diff would have bounced them.
-      const review = stage.fake.publishedReviews(7).at(-1)!;
+      const review = stage.fake.publishedReviews(stage.pullNumber).at(-1)!;
       expect(review.comments).toHaveLength(2);
       const run = (await stage.host.runHistory().allRuns({} as never)).at(-1)!;
       expect(run.pinnedDiff).toBe(unifiedDiff());

@@ -4,7 +4,8 @@
  * process boundary; everything inside the host runs for real).
  */
 import { join } from "node:path";
-import { openReviewHost, type ReviewHost } from "../../src/review-host/review-host.js";
+import type { ReviewHost } from "../../src/review-host/review-host.js";
+import { openHostOnStorage } from "./host-on-storage.js";
 import { FakeGitHub } from "../fixtures/fake-github.js";
 import { ModelStub, type StubScript } from "../fixtures/model-stub.js";
 import { unifiedDiff, type GitRepoFixture } from "../fixtures/git-fixture.js";
@@ -35,7 +36,7 @@ export async function openScenarioStage(
   const primaryStub = new ModelStub(opts.primary, "stub-primary");
   const reReviewStub = new ModelStub(opts.reReview, "stub-rereview");
   const [primaryBase, reReviewBase] = await Promise.all([primaryStub.listen(), reReviewStub.listen()]);
-  const host = await openReviewHost(
+  const host = await openHostOnStorage(
     {
       repository: "example/widgets",
       pullNumber: 7,
@@ -55,7 +56,7 @@ export async function openScenarioStage(
       repositoryInstructionsRevision: repo.baseSha,
       headCheckoutSource: repo.headCheckout(),
     },
-    join(opts.workspace, `run-${Math.random().toString(36).slice(2)}.sqlite`),
+    join(opts.workspace, `run-${Math.random().toString(36).slice(2)}`),
   );
   return { fake, primaryStub, reReviewStub, host };
 }

@@ -13,7 +13,8 @@ import { join } from "node:path";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
-import { openReviewHost, type ReviewHost } from "../../src/review-host/review-host.js";
+import type { ReviewHost } from "../../src/review-host/review-host.js";
+import { openHostOnStorage } from "../helpers/host-on-storage.js";
 import { FakeGitHub, type FakePullRequest } from "../fixtures/fake-github.js";
 import { ModelStub, type StubScript } from "../fixtures/model-stub.js";
 import { createGitRepoFixture, unifiedDiff, type GitRepoFixture } from "../fixtures/git-fixture.js";
@@ -109,7 +110,7 @@ async function withStage(options: StageOptions, test: (stage: Stage) => Promise<
     fake.listen(),
   ]);
   try {
-    const host = await openReviewHost(
+    const host = await openHostOnStorage(
       {
         repository: "example/widgets",
         pullNumber: 7,
@@ -122,7 +123,7 @@ async function withStage(options: StageOptions, test: (stage: Stage) => Promise<
         headCheckoutSource: repo.headCheckout(),
         ...(options.autoMode ? { autoMode: options.autoMode } : {}),
       },
-      join(workspace, `gate-${Math.random().toString(36).slice(2)}.sqlite`),
+      join(workspace, `gate-${Math.random().toString(36).slice(2)}`),
     );
     try {
       await test({ primaryStub, reReviewStub, host, fake, pull });
@@ -685,7 +686,7 @@ describe("scenario: pending requests and named checks", () => {
   });
 
   it("fork approvals and delivery dedup survive a host restart", async () => {
-    const sqliteFile = join(workspace, `restart-approval-${Math.random().toString(36).slice(2)}.sqlite`);
+    const storageDir = join(workspace, `restart-approval-${Math.random().toString(36).slice(2)}`);
     const pull: FakePullRequest = {
       number: 7,
       headSha: repo.headSha,
@@ -698,7 +699,7 @@ describe("scenario: pending requests and named checks", () => {
       const [primaryBase, reReviewBase, githubBase] = await Promise.all([
         primaryStub.listen(), reReviewStub.listen(), fake.listen(),
       ]);
-      return openReviewHost(
+      return openHostOnStorage(
         {
           repository: "example/widgets",
           pullNumber: 7,
@@ -714,7 +715,7 @@ describe("scenario: pending requests and named checks", () => {
             events: { opened: false, reopened: false, synchronize: true, readyForReview: false },
           },
         },
-        sqliteFile,
+        storageDir,
       );
     };
 
@@ -784,7 +785,7 @@ describe("scenario: pending requests and named checks", () => {
   });
 
   it("a pending automatic request for named checks survives a host restart", async () => {
-    const sqliteFile = join(workspace, `restart-pending-${Math.random().toString(36).slice(2)}.sqlite`);
+    const storageDir = join(workspace, `restart-pending-${Math.random().toString(36).slice(2)}`);
     const pull: FakePullRequest = {
       number: 7,
       headSha: repo.headSha,
@@ -795,7 +796,7 @@ describe("scenario: pending requests and named checks", () => {
       const [primaryBase, reReviewBase, githubBase] = await Promise.all([
         primaryStub.listen(), reReviewStub.listen(), fake.listen(),
       ]);
-      return openReviewHost(
+      return openHostOnStorage(
         {
           repository: "example/widgets",
           pullNumber: 7,
@@ -812,7 +813,7 @@ describe("scenario: pending requests and named checks", () => {
             waitForChecks: ["lint"],
           },
         },
-        sqliteFile,
+        storageDir,
       );
     };
 

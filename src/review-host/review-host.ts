@@ -1,11 +1,25 @@
 /**
- * Review host: wires storage, pi-ai models, the durable harness, and the
- * review pipeline behind the spec's single test seam — the review host's
- * process boundary.
+ * Review host: wires the storage service, pi-ai models, the durable harness,
+ * and the review pipeline behind the spec's single test seam — the review
+ * host's process boundary.
  *
- * Everything inside the host runs for real: Pi Durable (SQLite file), the
- * provider bridge, run documents, per-stage checkouts, and the publisher
- * (HTTP to GitHub).
+ * Everything inside the host runs for real: Pi Durable against the storage
+ * service (ticket 06: state lives on the homelab, partitioned by repository
+ * and PR — never on the runner), the provider bridge, run documents,
+ * per-stage checkouts, and the publisher (HTTP to GitHub).
+ *
+ * Durable recovery (ticket 06):
+ * - The host opens one partition of the storage service. A second opener
+ *   while the lease is live is refused (`StorageInUse`) — one process owns a
+ *   PR's storage at a time.
+ * - `handleReviewCommand` resumes an interrupted attempt instead of starting
+ *   a second one: an in-progress run for the same head is joined (its
+ *   recorded pipeline task survives reopen and resumes at the last durable
+ *   checkpoint); a failed run for the same head starts a new durable task
+ *   that picks up where the run document's already-frozen work is. A
+ *   published head stays published.
+ * - Every model stage has a deadline; a timed-out reviewer fails the stage
+ *   as incomplete and the durable work is kept for a re-run.
  *
  * Trigger gate (ticket 03): commands and, when opted in, automatic
  * pull-request events go through `TriggerGate`. The requester must be a
@@ -18,11 +32,11 @@ import type { Context } from "@earendil-works/chord";
 import { createModels, type Models } from "@earendil-works/pi-ai";
 import { Harness, createRegistry, type ToolRegistration } from "@earendil-works/pi-durable";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
-import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { RestGitHubApi } from "../github/rest-api.js";
 import { Publisher } from "../github/publisher.js";
 import { createBridgedProvider } from "../pi-bridge/provider-bridge.js";
+import { openRemoteStorage, StorageInUse, type RemoteStorage } from "../storage/remote-storage.js";
 import { ensureStageCheckouts, CheckoutError } from "./checkouts.js";
 import { isFullSha, resolveConfig, type ReviewHostConfig, type AutoModeConfig } from "./config.js";
 import { resolveInstructions } from "./instructions.js";
@@ -45,12 +59,16 @@ import {
   type ReviewTaskDeps,
 } from "./review-task.js";
 
+export { StorageInUse, CheckoutError };
+
 export interface ReviewHost {
   /**
    * Trigger gate entry: all issue-comment commands (`/review`, `/review
    * clean`, `/review cancel`). The gate applies the same requester check to
    * each; `/review` starts one run for the current head, the other commands
-   * are recognised but wired by tickets 07/09. Refusals return a reason.
+   * are recognised but wired by tickets 07/09. Refusals return a reason. A
+   * failed attempt for the same head is resumed rather than restarted
+   * (ticket 06).
    */
   handleReviewCommand(command: {
     repository: string;
@@ -105,10 +123,14 @@ export type NamedCheckProbe = (
 
 export async function openReviewHost(
   workflowInputConfig: ReviewHostConfig,
-  sqliteFile: string,
 ): Promise<ReviewHost> {
   const config = resolveConfig(workflowInputConfig);
-  const storage = await openNodeSqliteStorage(sqliteFile, { busyTimeoutMs: 5_000 });
+  const storage: RemoteStorage = await openRemoteStorage({
+    baseUrl: config.storage.baseUrl,
+    authToken: config.storage.authToken,
+    repository: config.repository,
+    pullNumber: config.pullNumber,
+  });
 
   const models = createModels();
   models.setProvider(
@@ -157,8 +179,10 @@ export async function openReviewHost(
     runHistory,
     api: new RestGitHubApi(config.githubBaseUrl, config.githubToken),
     getInstructions: (role) => resolveInstructions(role, config.repositoryInstructions),
+    stageDeadline: (stage) => (stage === "primary" ? config.primaryDeadlineMs : config.reReviewDeadlineMs),
   };
   installReviewTaskDeps(deps);
+  // Reopen recovery: interrupted tasks resume from their last checkpoint.
   harness.resume();
 
   return new ReviewHostImpl(harness, runHistory, models, config, deps.api);
@@ -166,6 +190,7 @@ export async function openReviewHost(
 
 class ReviewHostImpl implements ReviewHost {
   private activeRuns = new Map<string, Promise<void>>();
+  private settledRuns = new Map<string, Promise<void>>();
   /** Per-PR serial chain that serializes gate decisions with run starts. */
   private prQueues = new Map<string, Promise<unknown>>();
   /** Per-PR pending-request drain loops, awaited by drainPendingRequests(). */
@@ -239,7 +264,15 @@ class ReviewHostImpl implements ReviewHost {
       case "start":
         return this.startRun(evaluation.request, evaluation.deliveryKey);
       case "satisfied":
-        // A running review already covers the head: return its run.
+        // A running review already covers the head: join its run. On a
+        // re-opened host the run's recorded pipeline task survives (pending at
+        // its last checkpoint), so the caller waits on that task (ticket 06).
+        this.trackTask(
+          evaluation.run.runId,
+          evaluation.run.pipelineTaskId,
+          evaluation.run.subject.repository,
+          evaluation.run.subject.pullNumber,
+        );
         return { runId: evaluation.run.runId, conversationId: evaluation.run.canonicalConversationId, outcome: "satisfied" };
       case "queued":
         // The newest eligible head is stored as the PR's pending request;
@@ -426,6 +459,22 @@ class ReviewHostImpl implements ReviewHost {
     deliveryKey: string,
     options: { pendingKey?: string } = {},
   ): Promise<{ runId: string; conversationId: string; outcome: "start" }> {
+    // A failed or interrupted attempt for the same head resumes the same
+    // run (ticket 06): a new durable task picks up where the run document's
+    // durable work is (re-review if the artifact froze, publish if the final
+    // review froze, otherwise the primary stage runs again).
+    const interrupted = (await this.history.allRuns(TODO_CONTEXT)).find(
+      (r) =>
+        r.subject.repository === request.repository &&
+        r.subject.pullNumber === request.pullNumber &&
+        r.subject.headSha === request.headSha &&
+        r.checkStatus === "failure",
+    );
+    if (interrupted) {
+      const resumed = await this.resumeInterruptedRun(interrupted);
+      return { runId: resumed.runId, conversationId: resumed.conversationId, outcome: "start" as const };
+    }
+
     // Per-stage unchanged checkouts of the reviewed head.
     const checkouts = ensureStageCheckouts(this.config.headCheckoutSource, request.headSha);
 
@@ -505,26 +554,78 @@ class ReviewHostImpl implements ReviewHost {
       return { runId, taskId };
     }, TODO_CONTEXT);
 
-    this.run(started.taskId as unknown as string, started.runId, request.repository, request.pullNumber);
+    this.trackTask(started.runId, started.taskId as unknown as string, request.repository, request.pullNumber);
     return { runId: started.runId, conversationId: canonicalId!, outcome: "start" as const };
   }
 
-  /** Track one run to terminal state, then kick the PR's pending drain. */
-  private run(taskId: string, runId: string, repository: string, pullNumber: number): void {
-    const finished = this.harness
+  /** Actions re-run: pick the same attempt back up on a new durable task. */
+  private async resumeInterruptedRun(
+    runDoc: RunDocument,
+  ): Promise<{ runId: string; refused?: string; conversationId: string }> {
+    const context = TODO_CONTEXT;
+    const initialPhase: "primary" | "re-review" | "match" | "publish" = runDoc.finalReview
+      ? runDoc.matches !== undefined
+        ? "publish"
+        : "match"
+      : runDoc.artifactFrozen && runDoc.artifact
+        ? "re-review"
+        : "primary";
+
+    // The check goes back to in progress with the resumed stage.
+    try {
+      await new Publisher(this.api).checkInProgress(runDoc.subject, initialPhase);
+    } catch {
+      // A check-start failure must not stop the resumed attempt.
+    }
+
+    const request = toRunRequest(runDoc);
+    const resumed = await this.harness.commit(async (tx) => {
+      const taskId = await tx.createTask(
+        reviewTask,
+        { runId: runDoc.runId, canonicalConversationId: runDoc.canonicalConversationId, request, initialPhase },
+        { ownership: { kind: "conversation" }, conversationId: runDoc.canonicalConversationId as never },
+      );
+      // Strict JSON documents: clear the error by omitting the key.
+      const { error: _clearedError, ...kept } = runDoc;
+      void _clearedError;
+      const updated: RunDocument = {
+        ...kept,
+        pipelineTaskId: taskId as unknown as string,
+        phase: phaseForResume(initialPhase),
+        checkStatus: "in progress",
+        checkDetail: `stage: ${initialPhase} (resumed)`,
+      };
+      await this.history.record(tx, updated);
+      return { runId: runDoc.runId, taskId };
+    }, context);
+
+    this.trackTask(resumed.runId, resumed.taskId as unknown as string, runDoc.subject.repository, runDoc.subject.pullNumber);
+    return { runId: resumed.runId, conversationId: runDoc.canonicalConversationId };
+  }
+
+  /**
+   * Track one run to its terminal state. A finished run moves from
+   * `activeRuns` (what the drain loop waits out) to `settledRuns` (what
+   * `waitForRun` reads), then kicks the PR's pending drain (ticket 03).
+   */
+  private trackTask(runId: string, taskId: string, repository: string, pullNumber: number): void {
+    if (this.activeRuns.has(runId)) return;
+    // The rejection is not lost: waitForRun reads the durable run document,
+    // which records the error/check outcome for every terminal state.
+    const finished: Promise<void> = this.harness
       .waitForTask(taskId as never, TODO_CONTEXT)
-      .then(() => undefined)
-      .finally(() => {
+      .then(() => undefined, () => undefined)
+      .then(() => {
         this.activeRuns.delete(runId);
-        return this.ensureDrainLoop(repository, pullNumber);
-      })
-      .catch(() => undefined);
+        this.settledRuns.set(runId, finished);
+        return this.ensureDrainLoop(repository, pullNumber).catch(() => undefined);
+      });
     this.activeRuns.set(runId, finished);
   }
 
   async waitForRun(runId: string): Promise<void> {
-    const active = this.activeRuns.get(runId);
-    if (!active) throw new Error(`unknown run ${runId}`);
+    const active = this.activeRuns.get(runId) ?? this.settledRuns.get(runId);
+    if (!active) throw new Error(`unknown run ${runId} (tracking ${[...this.activeRuns.keys()].join(",")})`);
     try {
       await active;
       // Surface terminal failures/aborts as errors on the host seam.
@@ -533,6 +634,7 @@ class ReviewHostImpl implements ReviewHost {
       if (run?.checkStatus === "failure") throw new Error(run.checkDetail ?? "review failed");
     } finally {
       this.activeRuns.delete(runId);
+      this.settledRuns.delete(runId);
     }
   }
 
@@ -564,10 +666,12 @@ class ReviewHostImpl implements ReviewHost {
     // them. close() must not camp on a named-check wait.
     const pending = [...this.activeRuns.values()];
     this.activeRuns.clear();
-    await Promise.allSettled(pending);
     for (const [, loop] of this.draining) void loop.catch(() => undefined);
     this.draining.clear();
+    // Signal first: close aborts in-flight invocations, so their waits can
+    // settle; joining a hung generation before the signal would deadlock.
     await this.harness.close(TODO_CONTEXT);
+    await Promise.allSettled(pending);
   }
 }
 
@@ -583,10 +687,36 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** The resumed attempt's request, rebuilt from its run document. */
+function toRunRequest(runDoc: RunDocument): ReviewRunRequest {
+  return {
+    repository: runDoc.subject.repository,
+    pullNumber: runDoc.subject.pullNumber,
+    baseSha: runDoc.subject.baseSha,
+    headSha: runDoc.subject.headSha,
+    command: "/review",
+    source: runDoc.source ?? "command",
+    triggeredBy: runDoc.triggeredBy ?? "/review (resumed)",
+  };
+}
+
+function phaseForResume(initialPhase: "primary" | "re-review" | "match" | "publish"): RunDocument["phase"] {
+  switch (initialPhase) {
+    case "publish":
+      return "publishing";
+    case "match":
+      return "final frozen";
+    case "re-review":
+      return "re-review";
+    default:
+      return "primary";
+  }
+}
+
 function nodeEnv(cwd: string) {
   // Real execution environment: shell + file tools rooted at the reviewer's
   // unchanged checkout of the reviewed head.
   return new NodeExecutionEnv({ cwd, shellEnv: process.env }) as never;
 }
 
-export { CheckoutError };
+export type { RunDocument };
