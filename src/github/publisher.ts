@@ -11,10 +11,10 @@
  * with an explicit reason and is not retried here. Publication idempotency and
  * reconciliation are ticket 05; this thin slice publishes once per run.
  */
-import type { ParsedFinding } from "../review-host/artifact.js";
+import type { ReviewFinding } from "../review-host/artifact.js";
 import type { RunDocument } from "../review-host/run-history.js";
 
-/** Typed subset of the GitHub REST endpoints the publisher uses. */
+/** Typed subset of the GitHub REST endpoints the reviewer host uses. */
 export interface GitHubApi {
   createReview(
     repository: string,
@@ -39,6 +39,12 @@ export interface GitHubApi {
           output: { title: string; summary: string };
         },
   ): Promise<{ status: number; body: unknown }>;
+  /** Trigger-gate inputs (minimal gate for ticket 01; full gate is ticket 03). */
+  getPullRequest(repository: string, pullNumber: number): Promise<{ status: number; body: unknown }>;
+  getCollaboratorPermission(
+    repository: string,
+    username: string,
+  ): Promise<{ status: number; body: unknown }>;
 }
 
 export interface PublishedResult {
@@ -56,9 +62,10 @@ export class PublishError extends Error {
 }
 
 export function renderSummary(run: RunDocument, finalReview: string, findingCount: number): string {
+  const plural = findingCount === 1 ? "finding" : "findings";
   const summary = [
     `**Reviewed commit:** \`${run.subject.headSha}\``,
-    `**Outcome:** complete review with ${findingCount} finding${findingCount === 0 ? "s" : ""}`,
+    `**Outcome:** complete review with ${findingCount} ${plural}`,
     findingCount === 0 ? "No findings. The check succeeds on a complete review regardless of findings." : "",
     "",
     finalReview,
@@ -68,22 +75,17 @@ export function renderSummary(run: RunDocument, finalReview: string, findingCoun
   return summary;
 }
 
-/** Inline comment body: the finding's section verbatim. */
-export function renderInlineComment(finding: ParsedFinding): string {
-  return finding.section;
-}
-
 export class Publisher {
   constructor(readonly api: GitHubApi) {}
 
-  async checkInProgress(repository: string, headSha: string, stage: string): Promise<void> {
-    const response = await this.api.createCheckRun(repository, {
+  async checkInProgress(subject: RunDocument["subject"], stage: string): Promise<void> {
+    const response = await this.api.createCheckRun(subject.repository, {
       name: CHECK_NAME,
-      head_sha: headSha,
+      head_sha: subject.headSha,
       status: "in_progress",
       output: {
         title: "Review in progress",
-        summary: `Reviewing ${headSha.slice(0, 12)} · stage: ${stage}`,
+        summary: `Reviewing ${subject.headSha.slice(0, 12)} · stage: ${stage}`,
       },
     });
     if (response.status !== 201) {
@@ -93,16 +95,14 @@ export class Publisher {
 
   /** Publish one advisory review for the reviewed head. Failure = explicit reason. */
   async publish(
-    repository: string,
-    pullNumber: number,
     run: RunDocument,
     finalReview: string,
-    findings: ParsedFinding[],
+    findings: ReviewFinding[],
     signal?: AbortSignal,
   ): Promise<PublishedResult> {
     const response = await this.api.createReview(
-      repository,
-      pullNumber,
+      run.subject.repository,
+      run.subject.pullNumber,
       {
         commit_id: run.subject.headSha,
         event: "COMMENT",
@@ -111,7 +111,7 @@ export class Publisher {
           path: f.path,
           side: f.side,
           line: f.line,
-          body: renderInlineComment(f),
+          body: f.section,
         })),
       },
       signal,
@@ -121,7 +121,9 @@ export class Publisher {
       throw new PublishError(`GitHub rejected the review: ${describeBody(response.body)}`);
     }
     if (response.status !== 201) {
-      throw new PublishError(`GitHub create review failed with HTTP ${response.status}: ${describeBody(response.body)}`);
+      throw new PublishError(
+        `GitHub create review failed with HTTP ${response.status}: ${describeBody(response.body)}`,
+      );
     }
     const created = response.body as { id?: number; comments?: Array<{ id: number }> };
     if (typeof created.id !== "number") {
@@ -133,10 +135,10 @@ export class Publisher {
     };
   }
 
-  async checkSuccess(repository: string, headSha: string, findingCount: number): Promise<void> {
-    await this.api.createCheckRun(repository, {
+  async checkSuccess(subject: RunDocument["subject"], findingCount: number): Promise<void> {
+    const response = await this.api.createCheckRun(subject.repository, {
       name: CHECK_NAME,
-      head_sha: headSha,
+      head_sha: subject.headSha,
       status: "completed",
       conclusion: "success",
       output: {
@@ -147,16 +149,22 @@ export class Publisher {
             : `Complete review: ${findingCount} finding(s), all advisory.`,
       },
     });
+    if (response.status !== 201) {
+      throw new PublishError(`check-run completion failed with HTTP ${response.status}`);
+    }
   }
 
-  async checkFailure(repository: string, headSha: string, reason: string): Promise<void> {
-    await this.api.createCheckRun(repository, {
+  async checkFailure(subject: RunDocument["subject"], reason: string): Promise<void> {
+    const response = await this.api.createCheckRun(subject.repository, {
       name: CHECK_NAME,
-      head_sha: headSha,
+      head_sha: subject.headSha,
       status: "completed",
       conclusion: "failure",
       output: { title: "Review failed", summary: reason },
     });
+    if (response.status !== 201) {
+      throw new PublishError(`check-run completion failed with HTTP ${response.status}`);
+    }
   }
 }
 

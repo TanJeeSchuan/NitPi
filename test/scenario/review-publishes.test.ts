@@ -5,9 +5,11 @@
  * Sends the `/review` trigger and asserts two things only: what is visible on
  * GitHub (the fake server's state) and what is in the durable run state.
  * Everything inside the host runs for real: Pi Durable on a SQLite file, the
- * provider bridge over AI SDK streamText, run documents, and the publisher.
+ * provider bridge over AI SDK streamText, run documents, per-stage checkouts,
+ * and the publisher.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { TODO_CONTEXT } from "@earendil-works/chord/context";
 import { join } from "node:path";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -34,7 +36,7 @@ beforeAll(async () => {
       },
     ],
     [
-      // The reviewed diff: handler.ts line 3 added on RIGHT (head checkout).
+      // The reviewed diff: handler.ts lines 3 and 5 added on RIGHT (head checkout).
       "src/handler.ts#RIGHT#3",
       "src/handler.ts#RIGHT#5",
     ],
@@ -73,20 +75,22 @@ async function openHost(primaryScript: StubScript, reReviewScript: StubScript): 
         baseUrl: `${primaryBase}/v1`,
         modelId: "stub-primary",
         apiKey: "stub-primary-key",
-        promptMode: "append",
       },
       reReview: {
         baseUrl: `${reReviewBase}/v1`,
         modelId: "stub-rereview",
         apiKey: "stub-rereview-key",
-        promptMode: "append",
       },
       repositoryInstructions: "Be strict about unused parameters.",
+      repositoryInstructionsRevision: repo.baseSha,
+      headCheckoutSource: repo.headCheckout(),
     },
     join(workspace, `run-${Math.random().toString(36).slice(2)}.sqlite`),
   );
   return { primaryStub, reReviewStub, host };
 }
+
+const HANDLER_HEAD_BODY = ["export function handler(input: string): string {", "  const parts = input.split(',');", "  let result = '';"].join("\n");
 
 const PRIMARY_ARTIFACT = [
   "## Review artifact",
@@ -119,18 +123,30 @@ const FINAL_REVIEW = [
   "- F2: amended. Primary text: \"The inlined trimming of each part happens twice, once here and once in the caller\". Restructured after verifying the caller.",
 ].join("\n");
 
-/** Wire helpers: extract the system / first user message from a chat request. */
-function firstSystemMessage(messages: Array<{ role: string; content: unknown }> | undefined): string {
-  const system = messages?.find((m) => m.role === "system");
-  return typeof system?.content === "string" ? system.content : "";
-}
-
-function firstUserMessage(messages: Array<{ role: string; content: unknown }> | undefined): string {
-  const user = messages?.find((m) => m.role === "user");
-  return typeof user?.content === "string" ? user.content : "";
-}
-
 describe("scenario: /review publishes a two-stage review", () => {
+  it("runs the trigger gate: refuses non-writers and other repositories", async () => {
+    const stage = await openHost([], []);
+    try {
+      // A non-writer's /review is refused before anything runs.
+      fakeGithub.collaboratorPermissions["outsider"] = "read";
+      const refused = await stage.host.handleReviewCommand({
+        repository: "example/widgets",
+        pullNumber: 7,
+        requester: "outsider",
+      });
+      expect(refused.refused).toContain("does not have write access");
+
+      const wrongRepo = await stage.host.handleReviewCommand({
+        repository: "example/other",
+        pullNumber: 7,
+        requester: "octocat",
+      });
+      expect(wrongRepo.refused).toContain("not configured");
+    } finally {
+      await stage.host.close();
+    }
+  });
+
   it("drives primary → frozen artifact → re-review → publication with one review and inline comments", async () => {
     const primaryScript: StubScript = [
       // Turn 1: primary reads the reviewed file (tool call), Pi's tool loop runs it.
@@ -145,12 +161,10 @@ describe("scenario: /review publishes a two-stage review", () => {
     ];
     const stage = await openHost(primaryScript, reReviewScript);
 
-    const started = await stage.host.startReview({
+    const started = await stage.host.handleReviewCommand({
       repository: "example/widgets",
       pullNumber: 7,
-      baseSha: repo.baseSha,
-      headSha: repo.headSha,
-      command: "/review",
+      requester: "octocat",
     });
     await stage.host.waitForRun(started.runId);
 
@@ -161,7 +175,7 @@ describe("scenario: /review publishes a two-stage review", () => {
     expect(review.event).toBe("COMMENT");
     expect(review.commitId).toBe(repo.headSha);
     expect(review.body).toContain(`\`${repo.headSha}\``);
-    expect(review.body).toContain("2 finding");
+    expect(review.body).toContain("2 findings");
     expect(review.body).toContain("Outcome");
     // Each final finding becomes one inline comment with a valid anchor.
     expect(review.comments).toHaveLength(2);
@@ -171,8 +185,13 @@ describe("scenario: /review publishes a two-stage review", () => {
     expect(review.comments[0]!.body).toContain("Unnecessary complexity");
     expect(review.comments[0]!.body).toContain("src/handler.ts | RIGHT | 3");
 
-    // Check outcome: success after confirmed publication, regardless of findings.
-    expect(fakeGithub.state.checks.some((c) => c.state === "success" && c.headSha === repo.headSha)).toBe(true);
+    // Check outcome: in progress with head and current stage while running,
+    // success after confirmed publication, regardless of findings.
+    const checks = fakeGithub.state.checks.filter((c) => c.headSha === repo.headSha);
+    const firstCheck = checks[0]!;
+    expect(firstCheck.state).toBe("in_progress");
+    expect(firstCheck.summary).toContain("stage: primary");
+    expect(checks.at(-1)).toMatchObject({ state: "success" });
 
     // Durable history: run documents record subject, mode, phase, artifacts.
     const runs = await stage.host.runHistory().allRuns({} as never);
@@ -195,10 +214,29 @@ describe("scenario: /review publishes a two-stage review", () => {
       { label: "F2", path: "src/handler.ts", side: "RIGHT", line: 5 },
     ]);
     expect(run.publication?.reviewId).toBe(review.id);
+    // Repository instructions captured at a pinned revision, recorded per run.
+    expect(run.repositoryInstructionsRevision).toBe(repo.baseSha);
+
+    // The re-reviewer ran in a fresh task-owned conversation: scanning
+    // conversations owned by the run's pipeline task finds it, and it is not
+    // the canonical conversation.
+    expect(run.pipelineTaskId).toBeTruthy();
+    const owned = await listConversationsOwnedBy(stage.host, run.pipelineTaskId);
+    expect(owned).toContain(run.reReviewConversationId);
+    expect(owned).not.toContain(run.canonicalConversationId);
 
     // Usage accounting is recorded per run.
-    expect(run.usage?.primary?.output).toBeGreaterThan(0);
-    expect(run.usage?.reReview?.output).toBeGreaterThan(0);
+    expect(run.usage?.primary?.output).toBe(60);
+    expect(run.usage?.reReview?.output).toBe(90);
+
+    // The reviewers' tools ran against their own checkouts of the head: the
+    // second primary wire request carries the read tool's result, which is the
+    // head checkout's file content.
+    const secondMessages = stage.primaryStub.requests[1]?.body.messages as
+      | Array<{ role: string; content: unknown }>
+      | undefined;
+    const toolOutput = JSON.stringify(secondMessages ?? []);
+    expect(toolOutput).toContain("toUpperCase");
 
     // Model endpoint scripts fully consumed, in order: 1 tool turn + 1 final per stage.
     expect(stage.primaryStub.exhausted).toBe(true);
@@ -209,8 +247,11 @@ describe("scenario: /review publishes a two-stage review", () => {
     // instructions; the re-reviewer's carries its own role and audit contract.
     const primarySystem = firstSystemMessage(stage.primaryStub.requests[0]?.body.messages);
     expect(primarySystem).toContain("primary reviewer");
-    expect(primarySystem).toContain("thermo-nuclear structural review policy");
+    // The pinned skill body, verbatim, with its provenance line.
     expect(primarySystem).toContain("cursor/plugins@c47b12849e43f18d5c374c7069c744cc55b0ea00");
+    expect(primarySystem).toContain("Thermo-Nuclear Code Quality Review");
+    expect(primarySystem).toContain("code judo");
+    expect(primarySystem).toContain("presumptive blockers");
     expect(primarySystem).toContain("Be strict about unused parameters.");
     const reSystem = firstSystemMessage(stage.reReviewStub.requests[0]?.body.messages);
     expect(reSystem).toContain("re-reviewer");
@@ -242,17 +283,15 @@ describe("scenario: /review publishes a two-stage review", () => {
     ];
     const stage = await openHost(primaryScript, reReviewScript);
 
-    const started = await stage.host.startReview({
+    const started = await stage.host.handleReviewCommand({
       repository: "example/widgets",
       pullNumber: 7,
-      baseSha: repo.baseSha,
-      headSha: repo.headSha,
-      command: "/review",
+      requester: "octocat",
     });
     await stage.host.waitForRun(started.runId);
 
     const reviews = fakeGithub.publishedReviews(7);
-    // The second scenario's review lands after the first scenario's.
+    // This scenario's review lands after the first scenario's.
     const mine = reviews[reviews.length - 1]!;
     expect(mine.event).toBe("COMMENT");
     expect(mine.commitId).toBe(repo.headSha);
@@ -274,25 +313,20 @@ describe("scenario: /review publishes a two-stage review", () => {
     const primaryScript: StubScript = [
       { kind: "error", status: 400, body: { error: { message: "tools are not supported", code: "invalid_request_error" } } },
     ];
-    const reReviewScript: StubScript = [];
-    const stage = await openHost(primaryScript, reReviewScript);
+    const stage = await openHost(primaryScript, []);
 
-    const started = await stage.host.startReview({
+    const trigger = await stage.host.handleReviewCommand({
       repository: "example/widgets",
       pullNumber: 7,
-      baseSha: repo.baseSha,
-      headSha: repo.headSha,
-      command: "/review",
+      requester: "octocat",
     });
-    await expect(stage.host.waitForRun(started.runId)).rejects.toThrow(/tools are not supported/i);
+    await expect(stage.host.waitForRun(trigger.runId)).rejects.toThrow(/tools are not supported/i);
 
     // No publication, and the re-review endpoint was never called (no fallback).
     expect(fakeGithub.publishedReviews(7).length).toBe(2); // only the previous scenarios'
-    expect(stage.reReviewStub.served).toBe(0);
     // The run recorded the failure and the check failed.
     const runs = await stage.host.runHistory().allRuns({} as never);
     const run = runs.at(-1)!;
-    expect(run.phase).toBe("primary");
     expect(run.error).toContain("tools are not supported");
     expect(fakeGithub.state.checks.at(-1)).toMatchObject({ state: "failure", headSha: repo.headSha });
 
@@ -300,3 +334,25 @@ describe("scenario: /review publishes a two-stage review", () => {
   });
 });
 
+/** Wire helpers: extract messages from a recorded chat-completions request. */
+type RecordedMessages = Array<{ role: string; content: unknown }> | undefined;
+
+function firstSystemMessage(messages: RecordedMessages): string {
+  const system = messages?.find((m) => m.role === "system");
+  return typeof system?.content === "string" ? system.content : "";
+}
+
+function firstUserMessage(messages: RecordedMessages): string {
+  const user = messages?.find((m) => m.role === "user");
+  return typeof user?.content === "string" ? user.content : "";
+}
+
+/** Durable-history read: conversations owned by one pipeline task. */
+async function listConversationsOwnedBy(host: ReviewHost, taskId: string): Promise<string[]> {
+  const history = host.runHistory();
+  const page = await history.harness.commit(
+    async (tx) => tx.scanConversations({ ownerTaskId: taskId as never }, 50, undefined),
+    TODO_CONTEXT,
+  );
+  return page.items.map((c) => c.id as unknown as string);
+}

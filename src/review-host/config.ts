@@ -1,14 +1,15 @@
 /**
  * Workflow-input configuration for the two review stages. Per the spec's
- * Configuration decision: workflow inputs carry endpoints and prompt policy;
- * GitHub secrets carry credentials. Inputs arrive already resolved.
+ * Configuration decision: workflow inputs carry endpoints and instructions;
+ * GitHub secrets carry credentials. Inputs arrive already resolved by the
+ * trusted main-branch workflow.
+ *
+ * Custom prompts per stage are ticket 10 and intentionally absent here.
  *
  * An endpoint that lacks streaming or tool-call support fails with an explicit
  * configuration error before any model call — there is no fallback model.
  */
 import type { StageConfig } from "../pi-bridge/provider-bridge.js";
-
-export type PromptMode = "append" | "replace";
 
 /** One stage's resolved configuration. */
 export interface StageInput {
@@ -18,9 +19,6 @@ export interface StageInput {
   readonly modelId: string;
   /** API key injected from a GitHub secret. */
   readonly apiKey: string;
-  /** Optional custom prompt from the trusted main-branch workflow. */
-  readonly customPrompt?: string;
-  readonly promptMode: PromptMode;
   /** Optional provider options merged into the model request. */
   readonly providerOptions?: Record<string, unknown>;
 }
@@ -37,24 +35,22 @@ export interface ReviewHostConfig {
   readonly reReview: StageInput;
   /**
    * Main-branch repository review instructions, captured at a pinned revision
-   * by the trigger workflow and passed in as trusted text.
+   * by the trusted main-branch workflow and passed in as trusted text.
    */
   readonly repositoryInstructions: string;
+  /** The pinned revision the instructions were captured at (recorded per run). */
+  readonly repositoryInstructionsRevision: string;
+  /**
+   * The workflow's checked-out repository directory. Each stage gets its own
+   * unchanged worktree of the reviewed head, created from this checkout.
+   */
+  readonly headCheckoutSource: string;
 }
 
 export class ConfigError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "ConfigError";
-  }
-}
-
-export class PromptConfigError extends ConfigError {
-  readonly stage: string;
-  constructor(stage: string, message: string) {
-    super(message);
-    this.name = "PromptConfigError";
-    this.stage = stage;
   }
 }
 
@@ -65,14 +61,6 @@ function requireStage(stage: string, input: StageInput | undefined): StageInput 
   }
   if (!input.modelId) throw new ConfigError(`${stage} modelId is required`);
   if (!input.apiKey) throw new ConfigError(`${stage} apiKey is required (GitHub secret)`);
-  // Replace mode with an empty prompt is a configuration error reported before
-  // any model call (spec: Custom prompts §9).
-  if (input.promptMode === "replace" && !input.customPrompt?.trim()) {
-    throw new PromptConfigError(stage, `${stage} promptMode is replace but the custom prompt is empty`);
-  }
-  if (!input.promptMode && input.customPrompt) {
-    throw new PromptConfigError(stage, `${stage} has a custom prompt without a promptMode`);
-  }
   return input;
 }
 
@@ -92,11 +80,22 @@ export function resolveConfig(input: ReviewHostConfig): ReviewHostConfig {
     throw new ConfigError(`repository must look like owner/name, got ${input.repository}`);
   }
   if (!Number.isInteger(input.pullNumber) || input.pullNumber <= 0) {
-    throw new ConfigError(`pullNumber must be a positive integer`);
+    throw new ConfigError("pullNumber must be a positive integer");
   }
   if (!input.githubToken) throw new ConfigError("githubToken is required");
+  if (!/^https?:\/\//.test(input.githubBaseUrl)) {
+    throw new ConfigError("githubBaseUrl must be an absolute http(s) URL");
+  }
   if (!input.repositoryInstructions?.trim()) {
-    throw new ConfigError("repositoryInstructions are required (captured from the main branch at a pinned revision)");
+    throw new ConfigError(
+      "repositoryInstructions are required (captured from the main branch at a pinned revision)",
+    );
+  }
+  if (!/^[0-9a-f]{40}$/i.test(input.repositoryInstructionsRevision)) {
+    throw new ConfigError("repositoryInstructionsRevision must be a full commit SHA");
+  }
+  if (!input.headCheckoutSource) {
+    throw new ConfigError("headCheckoutSource is required (the workflow's checked-out repository)");
   }
   requireStage("primary", input.primary);
   requireStage("re-review", input.reReview);

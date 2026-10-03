@@ -6,8 +6,10 @@
  *
  * Instructions per stage come from the resolved protocol + policy + repository
  * layers (instructions.ts). The primary turn runs in the canonical PR
- * conversation; the re-reviewer runs in a fresh conversation created by this
- * task with explicit agent configuration.
+ * conversation; the re-reviewer runs in a fresh task-owned conversation
+ * created by this task with explicit agent configuration, on its own unchanged
+ * checkout. It receives the frozen artifact plus repository and PR inputs —
+ * never the primary transcript.
  *
  * Module dependencies (`installReviewTaskDeps`) exist because pi-durable
  * resolves task definitions from the registry at invocation: the process-wide
@@ -15,14 +17,15 @@
  */
 import type { Context } from "@earendil-works/chord";
 import { TODO_CONTEXT } from "@earendil-works/chord/context";
+import { createHash } from "node:crypto";
 import type { Conversation, Harness } from "@earendil-works/pi-durable";
 import { defineTask } from "@earendil-works/pi-durable";
 import { Publisher, PublishError } from "../github/publisher.js";
 import type { GitHubApi } from "../github/publisher.js";
-import { parseFinalReview, type ParsedFinding } from "./artifact.js";
+import { parseFinalReview } from "./artifact.js";
 import type { ReviewHostConfig } from "./config.js";
 import type { ResolvedInstructions } from "./instructions.js";
-import type { RunDocument, RunHistory, RunReviewFinding } from "./run-history.js";
+import type { RunDocument, RunHistory } from "./run-history.js";
 
 export interface ReviewRunRequest {
   readonly repository: string;
@@ -66,60 +69,10 @@ export type ReviewTaskResult =
   | { readonly published: true; readonly reviewId: number }
   | { readonly published: false; readonly reason: string };
 
-
-
-/** Record a stage failure on the run document and GitHub, then rethrow so the
- * durable task faults with the reason. No provisional findings are published. */
-async function failRun(
-  runId: string,
-  context: Context,
-  phase: string,
-  error: unknown,
-): Promise<never> {
-  const host = reviewTaskDeps();
-  const reason = describe(error);
-  const runDoc = await host.runHistory.findRun(runId, context);
-  try {
-    if (runDoc) {
-      const publisher = new Publisher(host.api);
-      await publisher.checkFailure(host.config.repository, runDoc.subject.headSha, reason);
-    }
-  } catch {
-    // checkFailure itself failing must not mask the original reason.
-  }
-  await commitRunUpdateSafe(host, runId, context, (run) => ({
-    ...run,
-    phase: phase === "publish" ? "publishing" : run.phase,
-    checkStatus: "failure",
-    checkDetail: reason,
-    error: reason,
-  }));
-  throw error instanceof Error ? error : new Error(reason);
-}
-
-async function commitRunUpdateSafe(
-  host: ReviewTaskDeps,
-  runId: string,
-  context: Context,
-  mutate: (run: RunDocument) => RunDocument,
-): Promise<void> {
-  try {
-    await commitRunUpdate(host, runId, context, mutate);
-  } catch {
-    // If the run doc cannot be updated (storage failure), the throw above still
-    // surfaces the original failure through the task.
-  }
-}
-
-export const reviewTask = defineTask<
-  ReviewTaskInput,
-  ReviewCheckpoint,
-  ReviewTaskResult,
-  object
->({
+export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTaskResult, object>({
   name: "nitpi.review",
   version: 1,
-  initial: (input) => ({ phase: "primary" as const }),
+  initial: () => ({ phase: "primary" as const }),
   phases: {
     primary: async (task, runtime, context) => {
       try {
@@ -128,12 +81,20 @@ export const reviewTask = defineTask<
         if (!runDoc) throw new Error(`run ${task.input.runId} is not recorded`);
         const canonical = await harnessConversation(host.runHistory.harness, task.input.canonicalConversationId);
 
-        // Primary instructions: protocol + policy + repository layers.
+        // Primary instructions: protocol + policy + repository layers, with
+        // the content hash recorded on the run document.
         const instructions = host.getInstructions("primary");
-        await configureConversation(canonical, "nitpi-primary", host.config.primary.modelId, instructions.text, context);
+        await configureConversation(
+          canonical,
+          "nitpi-primary",
+          host.config.primary.modelId,
+          instructions.text,
+          runDoc.checkouts?.primary,
+          context,
+        );
 
         // Primary turn: one prompt, run to completion, Pi keeps the tool loop.
-        const prompt = buildPrimaryPrompt(host.config, runDoc);
+        const prompt = buildPrimaryPrompt(runDoc);
         await runConversationTurn(canonical, prompt, context);
 
         // Freeze the hand-off: stored unchanged as free-form text.
@@ -143,64 +104,83 @@ export const reviewTask = defineTask<
           ...run,
           artifact,
           artifactFrozen: true,
-          phase: "primary frozen" as const,
+          phase: "primary frozen",
+          instructionHashes: { ...run.instructionHashes, primary: sha256(instructions.text) },
           usage: { ...run.usage, primary: answer?.usageSummary },
         }));
 
         await runtime.commit(
-          (_tx, current) => ({ status: "running" as const, checkpoint: { ...current.state.checkpoint, phase: "re-review" as const } }),
+          (_tx, current) => ({
+            status: "running" as const,
+            checkpoint: { ...current.state.checkpoint, phase: "re-review" as const },
+          }),
           context,
         );
       } catch (error) {
-        if (isAbort(error)) throw error;
-        await failRun(task.input.runId, context, "primary", error);
+        await failRun(task.input.runId, context, error);
       }
     },
 
     "re-review": async (task, runtime, context) => {
       try {
-      const host = reviewTaskDeps();
-      const runDoc = await host.runHistory.findRun(task.input.runId, context);
-      if (!runDoc) throw new Error(`run ${task.input.runId} is not recorded`);
-      if (!runDoc.artifact) throw new Error("primary artifact is not frozen");
+        const host = reviewTaskDeps();
+        const runDoc = await host.runHistory.findRun(task.input.runId, context);
+        if (!runDoc) throw new Error(`run ${task.input.runId} is not recorded`);
+        if (!runDoc.artifact) throw new Error("primary artifact is not frozen");
 
-      // Fresh task-owned conversation for the re-reviewer. It receives the
-      // frozen artifact plus repository and PR inputs — never the primary
-      // transcript.
-      const instructions = host.getInstructions("re-review");
-      const conversation = await host.runHistory.createReReviewConversation(
-        task.input.runId,
-        host.config.reReview.modelId,
-        instructions.text,
-        context,
-      );
-      await commitRunUpdate(host, task.input.runId, context, (run) => ({
-        ...run,
-        reReviewConversationId: conversation.id as unknown as string,
-      }));
+        // The check keeps showing the current stage while running.
+        await new Publisher(host.api).checkInProgress(runDoc.subject, "re-review");
 
-      const prompt = buildReReviewPrompt(host.config, runDoc);
-      await runConversationTurn(conversation, prompt, context);
+        // Fresh task-owned conversation for the re-reviewer. The commit makes
+        // durable progress by creating the conversation; the task checkpoint
+        // changes at the phase boundary below.
+        let createdId: string | undefined;
+        await runtime.commit(async (tx) => {
+          const record = await tx.createConversation({
+            ownership: { kind: "task", taskId: runtime.taskId },
+          });
+          createdId = record.id as unknown as string;
+        }, context);
+        const conversation = await harnessConversation(host.runHistory.harness, createdId!);
+        const instructions = host.getInstructions("re-review");
+        await configureConversation(
+          conversation,
+          "nitpi-re-review",
+          host.config.reReview.modelId,
+          instructions.text,
+          runDoc.checkouts?.reReview,
+          context,
+        );
+        await commitRunUpdate(host, task.input.runId, context, (run) => ({
+          ...run,
+          reReviewConversationId: conversation.id as unknown as string,
+        }));
 
-      const answer2 = await latestAssistant(conversation, context);
-      const finalMarkdown = answer2?.text ?? "";
-      const parsed = parseFinalReview(finalMarkdown);
-      await commitRunUpdate(host, task.input.runId, context, (run) => ({
-        ...run,
-        finalReview: finalMarkdown,
-        auditNotes: parsed.auditNotes,
-        findings: parsed.findings.map(toRunFinding),
-        phase: "final frozen" as const,
-        usage: { ...run.usage, reReview: answer2?.usageSummary },
-      }));
+        const prompt = buildReReviewPrompt(runDoc);
+        await runConversationTurn(conversation, prompt, context);
 
-      await runtime.commit(
-        (_tx, current) => ({ status: "running" as const, checkpoint: { ...current.state.checkpoint, phase: "publish" as const } }),
-        context,
-      );
+        const answer2 = await latestAssistant(conversation, context);
+        const finalMarkdown = answer2?.text ?? "";
+        const parsed = parseFinalReview(finalMarkdown);
+        await commitRunUpdate(host, task.input.runId, context, (run) => ({
+          ...run,
+          finalReview: finalMarkdown,
+          auditNotes: parsed.auditNotes,
+          findings: parsed.findings,
+          phase: "final frozen",
+          instructionHashes: { ...run.instructionHashes, reReview: sha256(instructions.text) },
+          usage: { ...run.usage, reReview: answer2?.usageSummary },
+        }));
+
+        await runtime.commit(
+          (_tx, current) => ({
+            status: "running" as const,
+            checkpoint: { ...current.state.checkpoint, phase: "publish" as const },
+          }),
+          context,
+        );
       } catch (error) {
-        if (isAbort(error)) throw error;
-        await failRun(task.input.runId, context, "re-review", error);
+        await failRun(task.input.runId, context, error);
       }
     },
 
@@ -209,43 +189,48 @@ export const reviewTask = defineTask<
       const runDoc = await host.runHistory.findRun(task.input.runId, context);
       if (!runDoc?.finalReview) throw new Error("final review is not frozen");
       const publisher = new Publisher(host.api);
-      const repository = host.config.repository;
-      const headSha = runDoc.subject.headSha;
+      const subject = runDoc.subject;
 
       try {
-        await publisher.checkInProgress(repository, headSha, "publish");
+        await publisher.checkInProgress(subject, "publish");
         const published = await publisher.publish(
-          repository,
-          host.config.pullNumber,
           runDoc,
           runDoc.finalReview,
-          (runDoc.findings ?? []).map(fromRunFinding),
+          runDoc.findings ?? [],
           context.abortSignal,
         );
         await commitRunUpdate(host, task.input.runId, context, (run) => ({
           ...run,
           publication: { reviewId: published.reviewId, commentIds: published.commentIds },
-          phase: "published" as const,
-          checkStatus: "success" as const,
+          phase: "published",
+          checkStatus: "success",
           checkDetail: `published review ${published.reviewId} with ${run.findings?.length ?? 0} finding(s)`,
         }));
-        await publisher.checkSuccess(repository, headSha, runDoc.findings?.length ?? 0);
+        await publisher.checkSuccess(subject, runDoc.findings?.length ?? 0);
         await runtime.commit(
           (_tx) =>
             ({
               status: "terminal" as const,
-              outcome: { status: "completed" as const, result: { published: true, reviewId: published.reviewId } },
+              outcome: {
+                status: "completed" as const,
+                result: { published: true, reviewId: published.reviewId },
+              },
             }) as const,
           context,
         );
       } catch (error) {
-        const reason = error instanceof PublishError ? error.message : describe(error);
-        await publisher.checkFailure(repository, headSha, reason);
-        await commitRunUpdate(host, task.input.runId, context, (run) => ({
+        const reason = error instanceof PublishError ? error.message : errorText(error);
+        try {
+          await publisher.checkFailure(subject, reason);
+        } catch {
+          // checkFailure failing must not mask the publication reason.
+        }
+        await commitRunUpdateSafe(host, task.input.runId, context, (run) => ({
           ...run,
-          phase: "publishing" as const,
-          checkStatus: "failure" as const,
+          phase: "publishing",
+          checkStatus: "failure",
           checkDetail: reason,
+          error: reason,
         }));
         await runtime.commit(
           (_tx) =>
@@ -275,6 +260,46 @@ export const reviewTask = defineTask<
 
 // --- helpers ----------------------------------------------------------------
 
+/** Record a stage failure on the run document and GitHub, then rethrow so the
+ * durable task faults with the reason. No provisional findings are published. */
+async function failRun(
+  runId: string,
+  context: Context,
+  error: unknown,
+): Promise<never> {
+  const host = reviewTaskDeps();
+  const reason = errorText(error);
+  const runDoc = await host.runHistory.findRun(runId, context);
+  try {
+    if (runDoc) {
+      await new Publisher(host.api).checkFailure(runDoc.subject, reason);
+    }
+  } catch {
+    // checkFailure itself failing must not mask the original reason.
+  }
+  await commitRunUpdateSafe(host, runId, context, (run) => ({
+    ...run,
+    checkStatus: "failure",
+    checkDetail: reason,
+    error: reason,
+  }));
+  throw error instanceof Error ? error : new Error(reason);
+}
+
+async function commitRunUpdateSafe(
+  host: ReviewTaskDeps,
+  runId: string,
+  context: Context,
+  mutate: (run: RunDocument) => RunDocument,
+): Promise<void> {
+  try {
+    await commitRunUpdate(host, runId, context, mutate);
+  } catch {
+    // If the run doc cannot be updated, the rethrow in the caller still
+    // surfaces the original failure through the task.
+  }
+}
+
 async function harnessConversation(harness: Harness, conversationId: string): Promise<Conversation> {
   const conversation = await harness.conversation(conversationId as never, TODO_CONTEXT);
   if (!conversation) throw new Error(`conversation ${conversationId} not found`);
@@ -286,10 +311,11 @@ async function configureConversation(
   provider: string,
   modelId: string,
   instructions: string,
+  cwd: string | undefined,
   context: Context,
 ): Promise<void> {
   await conversation.configure(
-    { model: { provider, modelId }, instructions },
+    { model: { provider, modelId }, instructions, ...(cwd ? { cwd } : {}) },
     context,
   );
 }
@@ -309,52 +335,32 @@ export interface TurnAnswer {
   usageSummary: { input: number; output: number; totalTokens: number };
 }
 
+/** Newest assistant entry with text, scanning newest-first. */
 async function latestAssistant(conversation: Conversation, context: Context): Promise<TurnAnswer | undefined> {
   const page = await conversation.entries({ conversationId: conversation.id } as never, 20, undefined, context);
+  let newest: TurnAnswer | undefined;
   for (const entry of page.items) {
-    if (entry.kind === "pi.assistant") {
-      const model = entry.model ?? [];
-      for (const message of model) {
-        if (message.role === "assistant") {
-          const text = message.content
-            .filter((c): c is { type: "text"; text: string } => c.type === "text")
-            .map((c) => c.text)
-            .join("");
-          if (text.trim()) {
-            return {
-              text,
-              usageSummary: {
-                input: message.usage.input,
-                output: message.usage.output,
-                totalTokens: message.usage.totalTokens,
-              },
-            };
-          }
-        }
+    if (entry.kind !== "pi.assistant") continue;
+    for (const message of entry.model ?? []) {
+      if (message.role !== "assistant") continue;
+      const text = message.content
+        .filter((c): c is { type: "text"; text: string } => c.type === "text")
+        .map((c) => c.text)
+        .join("");
+      if (text.trim()) {
+        newest = {
+          text,
+          usageSummary: {
+            input: message.usage.input,
+            output: message.usage.output,
+            totalTokens: message.usage.totalTokens,
+          },
+        };
+        break;
       }
     }
   }
-  return undefined;
-}
-
-function toRunFinding(finding: ParsedFinding): RunReviewFinding {
-  return {
-    label: finding.label,
-    section: finding.section,
-    path: finding.path,
-    side: finding.side,
-    line: finding.line,
-  };
-}
-
-function fromRunFinding(finding: RunReviewFinding): ParsedFinding {
-  return {
-    label: finding.label,
-    section: finding.section,
-    path: finding.path,
-    side: finding.side,
-    line: finding.line,
-  };
+  return newest;
 }
 
 async function commitRunUpdate(
@@ -370,24 +376,24 @@ async function commitRunUpdate(
   }, context);
 }
 
-function isAbort(error: unknown): boolean {
-  return error instanceof Error && error.name === "AbortError";
-}
-
-function describe(error: unknown): string {
+function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function buildPrimaryPrompt(_config: ReviewHostConfig, run: RunDocument): string {
+function sha256(text: string): string {
+  return createHash("sha256").update(text).digest("hex");
+}
+
+function buildPrimaryPrompt(run: RunDocument): string {
   return [
     `Review pull request #${run.subject.pullNumber} in repository ${run.subject.repository}.`,
     `Reviewed head: ${run.subject.headSha} (base: ${run.subject.baseSha}).`,
-    `Mode: ${run.mode}. Use your tools on this checkout; do not push or commit anything.`,
+    `Mode: ${run.mode}. Use your tools on this checkout; do not push, commit or edit the pull request.`,
     `Finish with your free-form review artifact as your final assistant message.`,
   ].join("\n");
 }
 
-function buildReReviewPrompt(_config: ReviewHostConfig, run: RunDocument): string {
+function buildReReviewPrompt(run: RunDocument): string {
   return [
     `Verify the primary review of pull request #${run.subject.pullNumber} in ${run.subject.repository}.`,
     `Reviewed head: ${run.subject.headSha} (base: ${run.subject.baseSha}).`,
@@ -401,4 +407,4 @@ function buildReReviewPrompt(_config: ReviewHostConfig, run: RunDocument): strin
   ].join("\n");
 }
 
-export const __testing = { buildPrimaryPrompt, buildReReviewPrompt, latestAssistant };
+export const __testing = { buildPrimaryPrompt, buildReReviewPrompt };

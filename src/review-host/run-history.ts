@@ -9,10 +9,17 @@
  *   the source of truth for findings; run documents are bookkeeping.
  */
 import { TODO_CONTEXT } from "@earendil-works/chord/context";
-import type { Context, JsonValue } from "@earendil-works/chord";
-import { defineDoc, type Conversation, type Harness, type SessionDocToken, type Tx } from "@earendil-works/pi-durable";
+import type { Context } from "@earendil-works/chord";
+import {
+  defineDoc,
+  type Conversation,
+  type ConversationId,
+  type Harness,
+  type SessionDocToken,
+  type Tx,
+} from "@earendil-works/pi-durable";
+import type { ReviewFinding } from "./artifact.js";
 
-export type RunMode = "normal";
 export type RunPhase =
   | "primary"
   | "primary frozen"
@@ -26,20 +33,12 @@ export interface RunUsage {
   reReview?: { input: number; output: number; totalTokens: number };
 }
 
-export interface RunReviewFinding {
-  label: string;
-  /** The finding's section Markdown verbatim (source of truth for the body). */
-  section: string;
-  path: string;
-  side: "LEFT" | "RIGHT";
-  line: number;
-}
-
 export interface RunDocument {
   kind: "nitpi.run";
   version: 1;
   runId: string;
-  mode: RunMode;
+  /** Mode `normal`; `/review clean` is ticket 07. */
+  mode: "normal";
   phase: RunPhase;
   subject: {
     repository: string;
@@ -47,6 +46,8 @@ export interface RunDocument {
     baseSha: string;
     headSha: string;
   };
+  /** The durable review pipeline task driving this run. */
+  pipelineTaskId: string;
   /** Conversation of the canonical PR history this run continues. */
   canonicalConversationId: string;
   /** Frozen primary artifact, stored verbatim once primary review completes. */
@@ -54,17 +55,23 @@ export interface RunDocument {
   artifactFrozen: boolean;
   finalReview?: string;
   auditNotes?: string;
-  findings?: RunReviewFinding[];
+  findings?: ReviewFinding[];
   reReviewConversationId?: string;
   publication?: { reviewId: number; commentIds: number[] };
+  /** The instructions each stage actually used, by content hash. */
   instructionHashes?: { primary?: string; reReview?: string };
+  /** Pinned revision the repository instructions were captured at. */
+  repositoryInstructionsRevision?: string;
+  /** Per-stage unchanged checkouts of the reviewed head. */
+  checkouts?: { primary: string; reReview: string };
   usage?: RunUsage;
   checkStatus: "in progress" | "success" | "failure";
   checkDetail?: string;
   error?: string;
 }
 
-type RunsRegistryValue = { [key: string]: JsonValue } & { runs: RunDocument[] };
+type RunsRegistryValue = { [key: string]: JsonValueLike } & { runs: RunDocument[] };
+type JsonValueLike = null | boolean | number | string | JsonValueLike[] | { [key: string]: JsonValueLike };
 
 /** Session-scoped registry of runs (one process hosts one review host). */
 export const RunsRegistry: SessionDocToken<RunsRegistryValue> = defineDoc({
@@ -115,7 +122,6 @@ export class RunHistory {
   }
 
   async createCanonicalConversation(
-    request: { repository: string; pullNumber: number },
     agent: { modelId: string; instructions: string },
     context: Context,
   ): Promise<Conversation> {
@@ -131,28 +137,9 @@ export class RunHistory {
     );
   }
 
-  /** Fresh re-reviewer conversation for one run (task-owned boundary). */
-  async createReReviewConversation(
-    runId: string,
-    modelId: string,
-    instructions: string,
-    context: Context,
-  ): Promise<Conversation> {
-    const conversation = await this.harness.createConversation(
-      {
-        ownership: { kind: "ownerless" },
-        agent: {
-          model: { provider: "nitpi-re-review", modelId },
-          instructions,
-        },
-      },
-      context,
-    );
-    void runId;
-    return conversation;
-  }
-
   async usage(context: Context) {
     return this.harness.usage(context);
   }
 }
+
+export type { ConversationId };

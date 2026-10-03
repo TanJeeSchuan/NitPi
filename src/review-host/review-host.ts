@@ -4,7 +4,12 @@
  * process boundary.
  *
  * Everything inside the host runs for real: Pi Durable (SQLite file), the
- * provider bridge, run documents, and the publisher (HTTP to GitHub).
+ * provider bridge, run documents, per-stage checkouts, and the publisher
+ * (HTTP to GitHub).
+ *
+ * Trigger gate (ticket 01's minimal gate; the full gate is ticket 03):
+ * the requester must be a collaborator with write access, the pull request
+ * must be open, and at most one run exists per reviewed head.
  */
 import { TODO_CONTEXT } from "@earendil-works/chord/context";
 import type { Context } from "@earendil-works/chord";
@@ -14,16 +19,31 @@ import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { RestGitHubApi } from "../github/rest-api.js";
+import { Publisher } from "../github/publisher.js";
 import { createBridgedProvider } from "../pi-bridge/provider-bridge.js";
+import { ensureStageCheckouts, CheckoutError } from "./checkouts.js";
 import { resolveConfig, type ReviewHostConfig } from "./config.js";
 import { resolveInstructions } from "./instructions.js";
-import { RunHistory } from "./run-history.js";
-import type { ConversationId } from "@earendil-works/pi-durable";
-import { installReviewTaskDeps, reviewTask, type ReviewRunRequest, type ReviewTaskDeps } from "./review-task.js";
+import { RunHistory, type RunDocument } from "./run-history.js";
+import { type GitHubApi } from "../github/publisher.js";
+import {
+  installReviewTaskDeps,
+  reviewTask,
+  type ReviewRunRequest,
+  type ReviewTaskDeps,
+} from "./review-task.js";
 
 export interface ReviewHost {
-  /** Trigger gate (`/review`): starts exactly one durable run for the head. */
-  startReview(request: ReviewRunRequest): Promise<{ runId: string; conversationId: string }>;
+  /**
+   * Trigger gate entry: a writer's `/review`. Resolves the pull request,
+   * checks eligibility, and starts exactly one durable run for the current
+   * head. Rejects with a reason when the request is refused.
+   */
+  handleReviewCommand(command: {
+    repository: string;
+    pullNumber: number;
+    requester: string;
+  }): Promise<{ runId: string; refused?: string; conversationId: string }>;
   /** Resolves when the run's durable task reaches a terminal state. */
   waitForRun(runId: string): Promise<void>;
   /** Aggregate Pi usage for assertion by tests. */
@@ -40,37 +60,57 @@ export async function openReviewHost(
   const storage = await openNodeSqliteStorage(sqliteFile, { busyTimeoutMs: 5_000 });
 
   const models = createModels();
-  models.setProvider(createBridgedProvider({ stage: "primary", baseUrl: config.primary.baseUrl, modelId: config.primary.modelId, apiKey: config.primary.apiKey, providerOptions: config.primary.providerOptions }));
-  models.setProvider(createBridgedProvider({ stage: "re-review", baseUrl: config.reReview.baseUrl, modelId: config.reReview.modelId, apiKey: config.reReview.apiKey, providerOptions: config.reReview.providerOptions }));
+  models.setProvider(
+    createBridgedProvider({
+      stage: "primary",
+      baseUrl: config.primary.baseUrl,
+      modelId: config.primary.modelId,
+      apiKey: config.primary.apiKey,
+      providerOptions: config.primary.providerOptions,
+    }),
+  );
+  models.setProvider(
+    createBridgedProvider({
+      stage: "re-review",
+      baseUrl: config.reReview.baseUrl,
+      modelId: config.reReview.modelId,
+      apiKey: config.reReview.apiKey,
+      providerOptions: config.reReview.providerOptions,
+    }),
+  );
 
   const registry = createRegistry<ToolRegistration>();
   registry.install(CodingTools);
   registry.install({ name: "nitpi-review", tools: [], sections: [], tasks: [reviewTask], hooks: [], wraps: [] });
 
-  const harness = await Harness.open(storage, {
-    models,
-    registry,
-    settings: {
-      extensions: [],
-      compaction: { enabled: true, reserveTokens: 16_384, keepRecentTokens: 20_000, backgroundTokens: 32_768 },
-      stream: { timeoutMs: 300_000 },
-      retry: { enabled: true, maxRetries: 0 },
-      toolExecution: "parallel",
+  const harness = await Harness.open(
+    storage,
+    {
+      models,
+      registry,
+      settings: {
+        // Absent: every installed extension (CodingTools) is selected.
+        compaction: { enabled: true, reserveTokens: 16_384, keepRecentTokens: 20_000, backgroundTokens: 32_768 },
+        stream: { timeoutMs: 300_000 },
+        retry: { enabled: true, maxRetries: 0 },
+        toolExecution: "parallel",
+      },
+      env: (target) => nodeEnv(target.cwd ?? process.cwd()),
     },
-    env: (target) => nodeEnv(target.cwd ?? process.cwd()),
-  }, TODO_CONTEXT);
+    TODO_CONTEXT,
+  );
 
   const runHistory = new RunHistory(harness);
   const deps: ReviewTaskDeps = {
     config,
     runHistory,
     api: new RestGitHubApi(config.githubBaseUrl, config.githubToken),
-    getInstructions: (role) => resolveInstructions(role, role === "primary" ? config.primary : config.reReview, config.repositoryInstructions),
+    getInstructions: (role) => resolveInstructions(role, config.repositoryInstructions),
   };
   installReviewTaskDeps(deps);
   harness.resume();
 
-  return new ReviewHostImpl(harness, runHistory, models, config);
+  return new ReviewHostImpl(harness, runHistory, models, config, deps.api);
 }
 
 class ReviewHostImpl implements ReviewHost {
@@ -82,16 +122,72 @@ class ReviewHostImpl implements ReviewHost {
     private readonly history: RunHistory,
     private readonly models: Models,
     private readonly config: ReviewHostConfig,
+    private readonly api: GitHubApi,
   ) {}
 
-  async startReview(request: ReviewRunRequest): Promise<{ runId: string; conversationId: string }> {
+  async handleReviewCommand(command: {
+    repository: string;
+    pullNumber: number;
+    requester: string;
+  }): Promise<{ runId: string; refused?: string; conversationId: string }> {
     const context = TODO_CONTEXT;
-    const canonicalKey = `${request.repository}#${request.pullNumber}`;
+    // Same repository: the host is configured for exactly one repository.
+    if (command.repository !== this.config.repository) {
+      return { runId: "", refused: `reviewer is not configured for ${command.repository}`, conversationId: "" };
+    }
+
+    // The pull request must be open.
+    const pr = await this.api.getPullRequest(command.repository, command.pullNumber);
+    if (pr.status !== 200) {
+      return { runId: "", refused: `pull request not found (HTTP ${pr.status})`, conversationId: "" };
+    }
+    const prBody = pr.body as { state?: string; head?: { sha?: string }; base?: { sha?: string } };
+    if (prBody.state !== "open") {
+      return { runId: "", refused: "pull request is not open", conversationId: "" };
+    }
+
+    // Only collaborators with write access may request reviews.
+    const permission = await this.api.getCollaboratorPermission(command.repository, command.requester);
+    if (permission.status !== 200) {
+      return { runId: "", refused: `cannot read permission for ${command.requester}`, conversationId: "" };
+    }
+    const level = (permission.body as { permission?: string }).permission ?? "none";
+    if (level !== "write" && level !== "admin") {
+      return { runId: "", refused: `${command.requester} does not have write access`, conversationId: "" };
+    }
+
+    const headSha = prBody.head?.sha;
+    const baseSha = prBody.base?.sha;
+    if (!/^[0-9a-f]{40}$/i.test(headSha ?? "") || !/^[0-9a-f]{40}$/i.test(baseSha ?? "")) {
+      return { runId: "", refused: "pull request SHAs unavailable", conversationId: "" };
+    }
+
+    // At most one run per reviewed head: an in-progress run for the same head
+    // satisfies the request instead of starting a second one.
+    const existing = (await this.history.allRuns(context)).find(
+      (r) =>
+        r.subject.headSha === headSha &&
+        r.subject.pullNumber === command.pullNumber &&
+        r.checkStatus === "in progress",
+    );
+    if (existing) {
+      return { runId: existing.runId, conversationId: existing.canonicalConversationId };
+    }
+
+    // Per-stage unchanged checkouts of the reviewed head.
+    const checkouts = ensureStageCheckouts(this.config.headCheckoutSource, headSha!);
+
+    // The check shows in progress with the head and current stage while running.
+    await new Publisher(this.api).checkInProgress(
+      { repository: command.repository, pullNumber: command.pullNumber, baseSha: baseSha!, headSha: headSha! },
+      "primary",
+    );
+
+    const canonicalKey = `${command.repository}#${command.pullNumber}`;
     let canonicalId = this.canonicalIds.get(canonicalKey);
     if (!canonicalId) {
-      const primaryInstructions = resolveInstructions("primary", this.config.primary, this.config.repositoryInstructions);
+      const primaryInstructions = resolveInstructions("primary", this.config.repositoryInstructions);
       const canonical = await this.history.createCanonicalConversation(
-        request,
         { modelId: this.config.primary.modelId, instructions: primaryInstructions.text },
         context,
       );
@@ -99,38 +195,43 @@ class ReviewHostImpl implements ReviewHost {
       this.canonicalIds.set(canonicalKey, canonicalId);
     }
 
+    const runId = `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const request = toRunRequest(command, baseSha!, headSha!);
     const started = await this.harness.commit(async (tx) => {
-      const run: RunDocumentShape = {
+      const taskId = await tx.createTask(
+        reviewTask,
+        { runId, canonicalConversationId: canonicalId!, request },
+        { ownership: { kind: "conversation" }, conversationId: canonicalId as never },
+      );
+      const run: RunDocument = {
         kind: "nitpi.run",
         version: 1,
-        runId: `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+        runId,
         mode: "normal",
         phase: "primary",
         subject: {
-          repository: request.repository,
-          pullNumber: request.pullNumber,
-          baseSha: request.baseSha,
-          headSha: request.headSha,
+          repository: command.repository,
+          pullNumber: command.pullNumber,
+          baseSha: baseSha!,
+          headSha: headSha!,
         },
+        pipelineTaskId: taskId as unknown as string,
+        canonicalConversationId: canonicalId!,
         artifactFrozen: false,
         checkStatus: "in progress",
-        checkDetail: `stage: primary · head ${request.headSha.slice(0, 12)}`,
-        canonicalConversationId: canonicalId!,
+        checkDetail: "stage: primary",
+        checkouts,
+        repositoryInstructionsRevision: this.config.repositoryInstructionsRevision,
       };
       await this.history.record(tx, run);
-      const taskId = await tx.createTask(
-        reviewTask,
-        { runId: run.runId, canonicalConversationId: canonicalId!, request },
-        { ownership: { kind: "conversation" }, conversationId: canonicalId as unknown as ConversationId, },
-      );
-      return { runId: run.runId, taskId };
+      return { runId, taskId };
     }, context);
 
     this.activeRuns.set(
       started.runId,
       this.harness.waitForTask(started.taskId, TODO_CONTEXT).then(() => undefined),
     );
-    return { runId: started.runId, conversationId: canonicalId as unknown as string };
+    return { runId: started.runId, conversationId: canonicalId! };
   }
 
   async waitForRun(runId: string): Promise<void> {
@@ -163,10 +264,24 @@ class ReviewHostImpl implements ReviewHost {
   }
 }
 
-type RunDocumentShape = Parameters<RunHistory["record"]>[1];
+function toRunRequest(
+  command: { repository: string; pullNumber: number },
+  baseSha: string,
+  headSha: string,
+): ReviewRunRequest {
+  return {
+    repository: command.repository,
+    pullNumber: command.pullNumber,
+    baseSha,
+    headSha,
+    command: "/review",
+  };
+}
 
 function nodeEnv(cwd: string) {
-  // Real execution environment: shell + file access rooted at the stage's
+  // Real execution environment: shell + file tools rooted at the reviewer's
   // unchanged checkout of the reviewed head.
   return new NodeExecutionEnv({ cwd, shellEnv: process.env }) as never;
 }
+
+export { CheckoutError };

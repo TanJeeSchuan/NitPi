@@ -44,6 +44,8 @@ export interface FakeGitHubState {
 
 export class FakeGitHub {
   readonly state: FakeGitHubState;
+  /** Login → permission level; default writer. Tests override per login. */
+  collaboratorPermissions: Record<string, "read" | "write" | "admin"> = {};
   private server: Server | undefined;
   private reviewsSeq = 100;
   private commentsSeq = 1000;
@@ -163,6 +165,30 @@ export class FakeGitHub {
       return;
     }
 
+    const prGetMatch = path.match(/^\/repos\/[^/]+\/[^/]+\/pulls\/(\d+)$/);
+    if (method === "GET" && prGetMatch) {
+      const pull = this.state.pulls[Number(prGetMatch[1])];
+      if (!pull) {
+        this.respond(response, 404, { message: "Not Found" });
+        return;
+      }
+      this.respond(response, 200, {
+        number: pull.number,
+        state: pull.state,
+        head: { sha: pull.headSha },
+        base: { sha: pull.baseSha },
+      });
+      return;
+    }
+
+    const permMatch = path.match(/^\/repos\/[^/]+\/[^/]+\/collaborators\/([^/]+)\/permission$/);
+    if (method === "GET" && permMatch) {
+      const user = decodeURIComponent(permMatch[1] ?? "");
+      const level = this.collaboratorPermissions[user] ?? "write";
+      this.respond(response, 200, { permission: level, user: { login: user } });
+      return;
+    }
+
     this.respond(response, 404, { message: `unrouted: ${method} ${path}` });
   }
 
@@ -192,7 +218,6 @@ export class FakeGitHub {
     return this.state.reviews.filter((r) => r.pullNumber === pullNumber && r.event !== "PENDING");
   }
 }
-
 /** Minimal HTTP client the publisher uses against the fake (or real) GitHub. */
 export class GitHubClient {
   constructor(readonly normalizedBase: string, readonly token: string) {}

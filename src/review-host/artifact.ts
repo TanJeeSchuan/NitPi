@@ -7,24 +7,36 @@
  * truth and nothing becomes a second source of truth.
  *
  * Ticket 01 assumes every inline anchor is valid; validation lands in ticket
- * 02. The publisher still refuses anchors outside the reviewed diff.
+ * 02. A labeled finding section without an inline location is a parse error,
+ * not a silent drop.
  */
-export interface ParsedFinding {
+export type DiffSide = "LEFT" | "RIGHT";
+
+/** One finding: the Markdown section plus the inline anchor derived from it. */
+export interface ReviewFinding {
   /** `F1`, `F2`, ... by section order (the reviewing labels). */
   label: string;
   /** Section text (heading + body + location) verbatim as written. */
   section: string;
   path: string;
-  side: "LEFT" | "RIGHT";
+  side: DiffSide;
   line: number;
 }
 
 export interface ParsedReview {
-  findings: ParsedFinding[];
+  findings: ReviewFinding[];
   auditNotes: string;
 }
 
+export class FinalReviewParseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "FinalReviewParseError";
+  }
+}
+
 const SECTION_HEADING = /^##\s+(.+?)\s*$/;
+const AUDIT_HEADING = /^#\s+Audit notes.*$/m;
 
 /**
  * Split the final review into `## ` sections and parse each section's trailing
@@ -36,7 +48,7 @@ export function parseFinalReview(markdown: string): ParsedReview {
   const normalized = markdown.replace(/\r\n/g, "\n");
   const { review, audit } = splitAudit(normalized);
   const sections = splitSections(review);
-  const findings: ParsedFinding[] = [];
+  const findings: ReviewFinding[] = [];
   for (const section of sections) {
     const parsed = parseSection(section, findings.length + 1);
     if (parsed) findings.push(parsed);
@@ -45,7 +57,7 @@ export function parseFinalReview(markdown: string): ParsedReview {
 }
 
 function splitAudit(markdown: string): { review: string; audit: string } {
-  const auditMarker = markdown.match(/^#\s+Audit notes.*$/m);
+  const auditMarker = markdown.match(AUDIT_HEADING);
   if (auditMarker && auditMarker.index !== undefined) {
     return {
       review: markdown.slice(0, auditMarker.index).trimEnd(),
@@ -74,7 +86,7 @@ function splitSections(review: string): string[] {
   return sections;
 }
 
-function parseSection(section: string, ordinal: number): ParsedFinding | undefined {
+function parseSection(section: string, ordinal: number): ReviewFinding | undefined {
   const lines = section.split("\n");
   const heading = SECTION_HEADING.exec(lines[0] ?? "");
   const headingText = heading?.[1] ?? "";
@@ -86,13 +98,19 @@ function parseSection(section: string, ordinal: number): ParsedFinding | undefin
       return { label, section, ...location };
     }
   }
-  // No inline location: not a publishable finding.
+  if (labelMatch) {
+    // A labeled finding without an inline location must not silently vanish.
+    throw new FinalReviewParseError(
+      `finding ${label} has no inline location line ("path | LEFT/RIGHT | line")`,
+    );
+  }
+  // Unlabeled sections (preamble-style) are not findings.
   return undefined;
 }
 
 export interface InlineLocation {
   path: string;
-  side: "LEFT" | "RIGHT";
+  side: DiffSide;
   line: number;
 }
 

@@ -38,7 +38,7 @@ import {
   type ToolCall,
   type ModelThinkingLevel,
 } from "@earendil-works/pi-ai";
-import { streamText } from "ai";
+import { streamText, jsonSchema } from "ai";
 import { formatProviderError, normalizeProviderError } from "@earendil-works/pi-ai/utils/error-body";
 import type { JsonObject } from "@earendil-works/pi-ai";
 
@@ -441,13 +441,14 @@ function activeToolsFromContext(context: TranscriptContext): Record<string, unkn
     }
   }
   // Declaration-only tool set: no `execute` — the AI SDK surfaces the calls as
-  // stream parts and Pi's tool loop does the execution.
+  // stream parts and Pi's tool loop does the execution. TypeBox parameters are
+  // JSON Schema objects; wrap them so the AI SDK sees a proper Schema.
   const toolSet: Record<string, unknown> = {};
   for (const [name, tool] of Object.entries(tools)) {
     const t = tool as Tool;
     toolSet[name] = {
       description: t.description,
-      inputSchema: t.parameters,
+      inputSchema: jsonSchema(t.parameters as never),
     };
   }
   return toolSet;

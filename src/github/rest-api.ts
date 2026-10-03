@@ -36,4 +36,15 @@ export class RestGitHubApi implements GitHubApi {
   createCheckRun(repository: string, payload: unknown) {
     return this.request<unknown>("POST", `/repos/${repository}/check-runs`, payload);
   }
+
+  getPullRequest(repository: string, pullNumber: number) {
+    return this.request<unknown>("GET", `/repos/${repository}/pulls/${pullNumber}`);
+  }
+
+  getCollaboratorPermission(repository: string, username: string) {
+    return this.request<unknown>(
+      "GET",
+      `/repos/${repository}/collaborators/${encodeURIComponent(username)}/permission`,
+    );
+  }
 }
