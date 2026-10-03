@@ -12,6 +12,9 @@ function baseConfig(): ReviewHostConfig {
     pullNumber: 7,
     githubToken: "t",
     githubBaseUrl: "http://github.test",
+    storage: { baseUrl: "http://storage.test", authToken: "storage-token" },
+    primaryDeadlineMs: 300_000,
+    reReviewDeadlineMs: 300_000,
     primary: baseStage(),
     reReview: baseStage(),
     repositoryInstructions: "repo rules",
@@ -65,5 +68,27 @@ describe("review host configuration", () => {
     const noCheckout = baseConfig();
     (noCheckout as { headCheckoutSource: string }).headCheckoutSource = "";
     expect(() => resolveConfig(noCheckout)).toThrow(ConfigError);
+  });
+
+  it("requires the storage service endpoint and positive reviewer deadlines", () => {
+    const noStorage = baseConfig();
+    (noStorage as { storage: unknown }).storage = undefined;
+    expect(() => resolveConfig(noStorage)).toThrow(ConfigError);
+
+    const badStorageUrl = baseConfig();
+    (badStorageUrl.storage as { baseUrl: string }).baseUrl = "not-a-url";
+    expect(() => resolveConfig(badStorageUrl)).toThrow(ConfigError);
+
+    const noStorageToken = baseConfig();
+    (noStorageToken.storage as { authToken: string }).authToken = "";
+    expect(() => resolveConfig(noStorageToken)).toThrow(ConfigError);
+
+    const zeroDeadline = baseConfig();
+    (zeroDeadline as { primaryDeadlineMs: number }).primaryDeadlineMs = 0;
+    expect(() => resolveConfig(zeroDeadline)).toThrow(ConfigError);
+
+    const weirdTimeout = baseConfig();
+    (weirdTimeout as { reReviewDeadlineMs: number }).reReviewDeadlineMs = Number.NaN;
+    expect(() => resolveConfig(weirdTimeout)).toThrow(ConfigError);
   });
 });

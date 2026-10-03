@@ -1,98 +1,43 @@
 /**
  * Scenario test (spec: Testing Decisions — one seam: the review host's
- * process boundary).
+ * process boundary) against the real storage service on localhost (ticket
+ * 06): every run's durable state lives on the service, not in direct local
+ * SQLite.
  *
- * Sends the `/review` trigger and asserts two things only: what is visible on
- * GitHub (the fake server's state) and what is in the durable run state.
- * Everything inside the host runs for real: Pi Durable on a SQLite file, the
- * provider bridge over AI SDK streamText, run documents, per-stage checkouts,
- * and the publisher.
+ * Sends the `/review` trigger and asserts what is visible on GitHub (the
+ * fake server's state) and what is in the durable run state. Everything
+ * inside the host runs for real: Pi Durable over the storage service, the
+ * provider bridge over AI SDK streamText, run documents, per-stage
+ * checkouts, and the publisher (with ticket 02's anchor validation).
  */
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { TODO_CONTEXT } from "@earendil-works/chord/context";
-import { join } from "node:path";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { openReviewHost, type ReviewHost } from "../../src/review-host/review-host.js";
-import { FakeGitHub } from "../fixtures/fake-github.js";
-import { ModelStub, type StubScript } from "../fixtures/model-stub.js";
-import { createGitRepoFixture, unifiedDiff, type GitRepoFixture } from "../fixtures/git-fixture.js";
+import { openScenarioJar, type ScenarioJar } from "../fixtures/scenario-jar.js";
+import type { RunHistory } from "../../src/review-host/run-history.js";
+import type { StubScript } from "../fixtures/model-stub.js";
 
-let workspace: string;
-let repo: GitRepoFixture;
-let fakeGithub: FakeGitHub;
-let githubBase: string;
-
-beforeAll(async () => {
-  workspace = mkdtempSync(join(tmpdir(), "nitpi-host-"));
-  repo = createGitRepoFixture();
-  fakeGithub = new FakeGitHub(
-    [
-      {
-        number: 7,
-        headSha: repo.headSha,
-        baseSha: repo.baseSha,
-        state: "open",
-      },
-    ],
-    [
-      // The reviewed diff: handler.ts lines 3 and 5 added on RIGHT (head checkout).
-      "src/handler.ts#RIGHT#3",
-      "src/handler.ts#RIGHT#5",
-    ],
-    // The pinned diff the anchor validator checks against (ticket 02).
-    { diffText: unifiedDiff() },
-  );
-  githubBase = await fakeGithub.listen();
-});
+const jars: ScenarioJar[] = [];
 
 afterAll(async () => {
-  await fakeGithub.close();
-  repo.dispose();
-  try {
-    rmSync(workspace, { recursive: true, force: true });
-  } catch {
-    // Windows can hold the SQLite file briefly after close; the OS temp dir
-    // cleans up. Cleanup failure must not fail the suite.
+  for (const jar of jars.splice(0).reverse()) {
+    await jar.dispose();
   }
 });
 
-interface Stage {
-  primaryStub: ModelStub;
-  reReviewStub: ModelStub;
-  host: ReviewHost;
+async function openJar(options: {
+  pullNumber: number;
+  primaryScript: StubScript;
+  reReviewScript: StubScript;
+}): Promise<ScenarioJar> {
+  const jar = await openScenarioJar({
+    pullNumber: options.pullNumber,
+    diffAnchors: ["src/handler.ts#RIGHT#3", "src/handler.ts#RIGHT#5"],
+    primaryScript: options.primaryScript,
+    reReviewScript: options.reReviewScript,
+  });
+  jars.push(jar);
+  return jar;
 }
-
-async function openHost(primaryScript: StubScript, reReviewScript: StubScript): Promise<Stage> {
-  const primaryStub = new ModelStub(primaryScript, "stub-primary");
-  const reReviewStub = new ModelStub(reReviewScript, "stub-rereview");
-  const [primaryBase, reReviewBase] = await Promise.all([primaryStub.listen(), reReviewStub.listen()]);
-  const host = await openReviewHost(
-    {
-      repository: "example/widgets",
-      pullNumber: 7,
-      githubToken: "test-token",
-      githubBaseUrl: githubBase,
-      primary: {
-        baseUrl: `${primaryBase}/v1`,
-        modelId: "stub-primary",
-        apiKey: "stub-primary-key",
-      },
-      reReview: {
-        baseUrl: `${reReviewBase}/v1`,
-        modelId: "stub-rereview",
-        apiKey: "stub-rereview-key",
-      },
-      repositoryInstructions: "Be strict about unused parameters.",
-      repositoryInstructionsRevision: repo.baseSha,
-      headCheckoutSource: repo.headCheckout(),
-    },
-    join(workspace, `run-${Math.random().toString(36).slice(2)}.sqlite`),
-  );
-  return { primaryStub, reReviewStub, host };
-}
-
-const HANDLER_HEAD_BODY = ["export function handler(input: string): string {", "  const parts = input.split(',');", "  let result = '';"].join("\n");
 
 const PRIMARY_ARTIFACT = [
   "## Review artifact",
@@ -107,7 +52,7 @@ const FINAL_REVIEW = [
   "",
   "## F1 — Unnecessary complexity: concatenation loop",
   "",
-  "handler() rebuilds the result string inside a loop. `parts.map(p => p.trim().toUpperCase()).join(\" \")` is simpler and preserves behavior.",
+  'handler() rebuilds the result string inside a loop. `parts.map(p => p.trim().toUpperCase()).join(" ")` is simpler and preserves behavior.',
   "",
   "Evidence: src/handler.ts lines 3-6 in the reviewed head replace the original one-line return expression.",
   "src/handler.ts | RIGHT | 3",
@@ -121,31 +66,32 @@ const FINAL_REVIEW = [
   "",
   "# Audit notes",
   "",
-  "- F1: retained. Primary text: \"The loop in handler() rebuilds result by concatenation — unnecessary complexity\". Verified against the head checkout.",
-  "- F2: amended. Primary text: \"The inlined trimming of each part happens twice, once here and once in the caller\". Restructured after verifying the caller.",
+  '- F1: retained. Primary text: "The loop in handler() rebuilds result by concatenation — unnecessary complexity". Verified against the head checkout.',
+  '- F2: amended. Primary text: "The inlined trimming of each part happens twice, once here and once in the caller". Restructured after verifying the caller.',
 ].join("\n");
 
 describe("scenario: /review publishes a two-stage review", () => {
   it("runs the trigger gate: refuses non-writers and other repositories", async () => {
-    const stage = await openHost([], []);
+    const jar = await openJar({ pullNumber: 7, primaryScript: [], reReviewScript: [] });
+    const stage = await jar.openHost();
     try {
       // A non-writer's /review is refused before anything runs.
-      fakeGithub.collaboratorPermissions["outsider"] = "read";
-      const refused = await stage.host.handleReviewCommand({
-        repository: "example/widgets",
+      jar.fakeGithub.collaboratorPermissions["outsider"] = "read";
+      const refused = await stage.handleReviewCommand({
+        repository: "example/scenario",
         pullNumber: 7,
         requester: "outsider",
       });
       expect(refused.refused).toContain("does not have write access");
 
-      const wrongRepo = await stage.host.handleReviewCommand({
+      const wrongRepo = await stage.handleReviewCommand({
         repository: "example/other",
         pullNumber: 7,
         requester: "octocat",
       });
       expect(wrongRepo.refused).toContain("not configured");
     } finally {
-      await stage.host.close();
+      await stage.close();
     }
   });
 
@@ -161,22 +107,23 @@ describe("scenario: /review publishes a two-stage review", () => {
       { toolCall: { id: "call-2", name: "read", input: JSON.stringify({ path: "src/handler.ts" }) } },
       { text: [FINAL_REVIEW], finishReason: "stop" as const, usage: { promptTokens: 200, completionTokens: 90 } },
     ];
-    const stage = await openHost(primaryScript, reReviewScript);
+    const jar = await openJar({ pullNumber: 8, primaryScript, reReviewScript });
+    const stage = await jar.openHost();
 
-    const started = await stage.host.handleReviewCommand({
-      repository: "example/widgets",
-      pullNumber: 7,
+    const started = await stage.handleReviewCommand({
+      repository: "example/scenario",
+      pullNumber: 8,
       requester: "octocat",
     });
-    await stage.host.waitForRun(started.runId);
+    await stage.waitForRun(started.runId);
 
     // GitHub: exactly one submitted review anchored at the reviewed head.
-    const reviews = fakeGithub.publishedReviews(7);
+    const reviews = jar.fakeGithub.publishedReviews(8);
     expect(reviews).toHaveLength(1);
     const review = reviews[0]!;
     expect(review.event).toBe("COMMENT");
-    expect(review.commitId).toBe(repo.headSha);
-    expect(review.body).toContain(`\`${repo.headSha}\``);
+    expect(review.commitId).toBe(jar.headSha);
+    expect(review.body).toContain(`\`${jar.headSha}\``);
     expect(review.body).toContain("2 findings");
     expect(review.body).toContain("Outcome");
     // Each final finding becomes one inline comment with a valid anchor.
@@ -189,21 +136,21 @@ describe("scenario: /review publishes a two-stage review", () => {
 
     // Check outcome: in progress with head and current stage while running,
     // success after confirmed publication, regardless of findings.
-    const checks = fakeGithub.state.checks.filter((c) => c.headSha === repo.headSha);
-    const firstCheck = checks[0]!;
-    expect(firstCheck.state).toBe("in_progress");
-    expect(firstCheck.summary).toContain("stage: primary");
+    const checks = jar.fakeGithub.state.checks;
+    expect(checks[0]).toMatchObject({ state: "in_progress" });
+    expect(checks[0]!.summary).toContain("stage: primary");
     expect(checks.at(-1)).toMatchObject({ state: "success" });
 
-    // Durable history: run documents record subject, mode, phase, artifacts.
-    const runs = await stage.host.runHistory().allRuns({} as never);
+    // Durable history (on the storage service): run documents record subject,
+    // mode, phase, artifacts.
+    const runs = await stage.runHistory().allRuns({} as never);
     expect(runs).toHaveLength(1);
     const run = runs[0]!;
     expect(run.subject).toEqual({
-      repository: "example/widgets",
-      pullNumber: 7,
-      baseSha: repo.baseSha,
-      headSha: repo.headSha,
+      repository: "example/scenario",
+      pullNumber: 8,
+      baseSha: jar.baseSha,
+      headSha: jar.headSha,
     });
     expect(run.mode).toBe("normal");
     expect(run.phase).toBe("published");
@@ -217,13 +164,15 @@ describe("scenario: /review publishes a two-stage review", () => {
     ]);
     expect(run.publication?.reviewId).toBe(review.id);
     // Repository instructions captured at a pinned revision, recorded per run.
-    expect(run.repositoryInstructionsRevision).toBe(repo.baseSha);
+    expect(run.repositoryInstructionsRevision).toBe(jar.baseSha);
+    // The pinned diff (ticket 02) is part of the durable run state.
+    expect(run.pinnedDiff).toContain("diff --git");
 
     // The re-reviewer ran in a fresh task-owned conversation: scanning
     // conversations owned by the run's pipeline task finds it, and it is not
     // the canonical conversation.
     expect(run.pipelineTaskId).toBeTruthy();
-    const owned = await listConversationsOwnedBy(stage.host, run.pipelineTaskId);
+    const owned = await listConversationsOwnedBy(stage.runHistory(), run.pipelineTaskId);
     expect(owned).toContain(run.reReviewConversationId);
     expect(owned).not.toContain(run.canonicalConversationId);
 
@@ -234,20 +183,20 @@ describe("scenario: /review publishes a two-stage review", () => {
     // The reviewers' tools ran against their own checkouts of the head: the
     // second primary wire request carries the read tool's result, which is the
     // head checkout's file content.
-    const secondMessages = stage.primaryStub.requests[1]?.body.messages as
+    const secondMessages = jar.primaryStub.requests[1]?.body.messages as
       | Array<{ role: string; content: unknown }>
       | undefined;
     const toolOutput = JSON.stringify(secondMessages ?? []);
     expect(toolOutput).toContain("toUpperCase");
 
     // Model endpoint scripts fully consumed, in order: 1 tool turn + 1 final per stage.
-    expect(stage.primaryStub.exhausted).toBe(true);
-    expect(stage.reReviewStub.exhausted).toBe(true);
+    expect(jar.primaryStub.exhausted).toBe(true);
+    expect(jar.reReviewStub.exhausted).toBe(true);
 
     // Instructions each stage sent are wire output: the primary's system
     // prompt carries protocol + pinned thermo-nuclear policy + repository
     // instructions; the re-reviewer's carries its own role and audit contract.
-    const primarySystem = firstSystemMessage(stage.primaryStub.requests[0]?.body.messages);
+    const primarySystem = firstSystemMessage(jar.primaryStub.requests[0]?.body.messages);
     expect(primarySystem).toContain("primary reviewer");
     // The pinned skill body, verbatim, with its provenance line.
     expect(primarySystem).toContain("cursor/plugins@c47b12849e43f18d5c374c7069c744cc55b0ea00");
@@ -255,84 +204,96 @@ describe("scenario: /review publishes a two-stage review", () => {
     expect(primarySystem).toContain("code judo");
     expect(primarySystem).toContain("presumptive blockers");
     expect(primarySystem).toContain("Be strict about unused parameters.");
-    const reSystem = firstSystemMessage(stage.reReviewStub.requests[0]?.body.messages);
+    const reSystem = firstSystemMessage(jar.reReviewStub.requests[0]?.body.messages);
     expect(reSystem).toContain("re-reviewer");
     expect(reSystem).toContain("audit notes");
     expect(reSystem).toContain("Be strict about unused parameters.");
     // The frozen artifact reached the re-reviewer through its prompt.
-    const reUser = firstUserMessage(stage.reReviewStub.requests[0]?.body.messages);
+    const reUser = firstUserMessage(jar.reReviewStub.requests[0]?.body.messages);
     expect(reUser).toContain("FROZEN PRIMARY REVIEW ARTIFACT");
     expect(reUser).toContain("The loop in handler() rebuilds result by concatenation");
 
-    await stage.host.close();
+    await stage.close();
   });
 
   it("publishes a zero-finding review and the check succeeds", async () => {
-    const primaryScript: StubScript = [
-      { text: ["No issues found. The change is a clean simplification."], finishReason: "stop" as const },
-    ];
-    const reReviewScript: StubScript = [
-      {
-        text: [
-          "# Final review",
-          "",
-          "# Audit notes",
-          "",
-          "- Nothing to audit: the primary found nothing to verify.",
-        ],
-        finishReason: "stop" as const,
-      },
-    ];
-    const stage = await openHost(primaryScript, reReviewScript);
+    const jar = await openJar({
+      pullNumber: 9,
+      primaryScript: [{ text: ["No issues found. The change is a clean simplification."], finishReason: "stop" as const }],
+      reReviewScript: [
+        {
+          text: [
+            "# Final review",
+            "",
+            "# Audit notes",
+            "",
+            "- Nothing to audit: the primary found nothing to verify.",
+          ],
+          finishReason: "stop" as const,
+        },
+      ],
+    });
+    const stage = await jar.openHost();
 
-    const started = await stage.host.handleReviewCommand({
-      repository: "example/widgets",
-      pullNumber: 7,
+    const started = await stage.handleReviewCommand({
+      repository: "example/scenario",
+      pullNumber: 9,
       requester: "octocat",
     });
-    await stage.host.waitForRun(started.runId);
+    await stage.waitForRun(started.runId);
 
-    const reviews = fakeGithub.publishedReviews(7);
-    // This scenario's review lands after the first scenario's.
-    const mine = reviews[reviews.length - 1]!;
-    expect(mine.event).toBe("COMMENT");
-    expect(mine.commitId).toBe(repo.headSha);
-    expect(mine.body).toContain("0 findings");
-    expect(mine.comments).toHaveLength(0);
-    expect(fakeGithub.state.checks.at(-1)).toMatchObject({ state: "success", headSha: repo.headSha });
+    const reviews = jar.fakeGithub.publishedReviews(9);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]!.event).toBe("COMMENT");
+    expect(reviews[0]!.commitId).toBe(jar.headSha);
+    expect(reviews[0]!.body).toContain("0 findings");
+    expect(reviews[0]!.comments).toHaveLength(0);
+    expect(jar.fakeGithub.state.checks.at(-1)).toMatchObject({
+      state: "success",
+      headSha: jar.headSha,
+    });
 
-    const runs = await stage.host.runHistory().allRuns({} as never);
-    const run = runs.at(-1)!;
-    expect(run.phase).toBe("published");
-    expect(run.artifact).toContain("No issues found");
-    expect(run.findings).toEqual([]);
+    const runs = await stage.runHistory().allRuns({} as never);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]!.phase).toBe("published");
+    expect(runs[0]!.artifact).toContain("No issues found");
+    expect(runs[0]!.findings).toEqual([]);
 
-    await stage.host.close();
+    await stage.close();
   });
 
   it("fails explicitly when the endpoint does not support tool calls; no fallback model", async () => {
     // The primary endpoint rejects tool-bearing requests with an explicit error.
-    const primaryScript: StubScript = [
-      { kind: "error", status: 400, body: { error: { message: "tools are not supported", code: "invalid_request_error" } } },
-    ];
-    const stage = await openHost(primaryScript, []);
+    const jar = await openJar({
+      pullNumber: 10,
+      primaryScript: [
+        { kind: "error", status: 400, body: { error: { message: "tools are not supported", code: "invalid_request_error" } } },
+      ],
+      reReviewScript: [
+        { kind: "error", status: 400, body: { error: { message: "tools are not supported", code: "invalid_request_error" } } },
+      ],
+    });
+    const stage = await jar.openHost();
 
-    const trigger = await stage.host.handleReviewCommand({
-      repository: "example/widgets",
-      pullNumber: 7,
+    const trigger = await stage.handleReviewCommand({
+      repository: "example/scenario",
+      pullNumber: 10,
       requester: "octocat",
     });
-    await expect(stage.host.waitForRun(trigger.runId)).rejects.toThrow(/tools are not supported/i);
+    await expect(stage.waitForRun(trigger.runId)).rejects.toThrow(/tools are not supported/i);
 
     // No publication, and the re-review endpoint was never called (no fallback).
-    expect(fakeGithub.publishedReviews(7).length).toBe(2); // only the previous scenarios'
+    expect(jar.fakeGithub.publishedReviews(10)).toHaveLength(0);
+    expect(jar.reReviewStub.requests).toHaveLength(0);
     // The run recorded the failure and the check failed.
-    const runs = await stage.host.runHistory().allRuns({} as never);
-    const run = runs.at(-1)!;
-    expect(run.error).toContain("tools are not supported");
-    expect(fakeGithub.state.checks.at(-1)).toMatchObject({ state: "failure", headSha: repo.headSha });
+    const runs = await stage.runHistory().allRuns({} as never);
+    expect(runs[0]!.error).toContain("tools are not supported");
+    expect(jar.fakeGithub.state.checks.at(-1)).toMatchObject({
+      state: "failure",
+      headSha: jar.headSha,
+    });
 
-    await stage.host.close();
+    await stage.close();
   });
 });
 
@@ -350,8 +311,7 @@ function firstUserMessage(messages: RecordedMessages): string {
 }
 
 /** Durable-history read: conversations owned by one pipeline task. */
-async function listConversationsOwnedBy(host: ReviewHost, taskId: string): Promise<string[]> {
-  const history = host.runHistory();
+async function listConversationsOwnedBy(history: RunHistory, taskId: string): Promise<string[]> {
   const page = await history.harness.commit(
     async (tx) => tx.scanConversations({ ownerTaskId: taskId as never }, 50, undefined),
     TODO_CONTEXT,

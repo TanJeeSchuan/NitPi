@@ -42,7 +42,7 @@ export interface GitHubApi {
           name: string;
           head_sha: string;
           status: "completed";
-          conclusion: "success" | "failure";
+          conclusion: "success" | "failure" | "neutral";
           output: { title: string; summary: string };
         },
   ): Promise<{ status: number; body: unknown }>;
@@ -181,6 +181,20 @@ export class Publisher {
     });
     if (response.status !== 201) {
       throw new PublishError(`check-run ${stage} failed with HTTP ${response.status}`);
+    }
+  }
+
+  /** A reviewer deadline passed: the attempt is incomplete, not failed outright. */
+  async checkIncomplete(subject: RunDocument["subject"], reason: string): Promise<void> {
+    const response = await this.api.createCheckRun(subject.repository, {
+      name: CHECK_NAME,
+      head_sha: subject.headSha,
+      status: "completed",
+      conclusion: "neutral",
+      output: { title: "Review incomplete", summary: reason },
+    });
+    if (response.status !== 201) {
+      throw new PublishError(`check-run completion failed with HTTP ${response.status}`);
     }
   }
 }
