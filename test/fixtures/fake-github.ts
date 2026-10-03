@@ -21,6 +21,8 @@ export interface FakePullRequest {
   state: "open" | "closed";
   /** Draft pull requests get no automatic review (ticket 03). */
   draft?: boolean;
+  /** GitHub records a merged pull request as state "closed" (ticket 09). */
+  merged?: boolean;
   /** Head repository full name; differs from `baseRepo` on fork pulls. */
   headRepo?: string;
   baseRepo?: string;
@@ -80,6 +82,10 @@ export interface FakeGitHubState {
   checks: Array<{ headSha: string; state: string; detail: string; summary: string }>;
   /** Scripted responses: applied-write, then dropped (unknown outcome). */
   dropNextWrite: { match: RegExp; remaining: number };
+  /** Hold the next matching POST's response this long before dispatching it
+   * (ticket 09: the publication write is in flight while the test cancels).
+   * The timer is unref'd so it never holds the process open. */
+  delayNext: { match: RegExp; ms: number; remaining: number };
   /** 422 detail for malformed anchors. */
   validationErrors: Map<string, string>;
   /**
@@ -126,6 +132,7 @@ export class FakeGitHub {
       threads: [],
       checks: [],
       dropNextWrite: { match: /reviews$/, remaining: 0 },
+      delayNext: { match: /reviews$/, ms: 0, remaining: 0 },
       validationErrors: new Map(),
       externalChecks: new Map(),
     };
@@ -148,7 +155,7 @@ export class FakeGitHub {
   }
 
   async listen(): Promise<string> {
-    this.server = createServer((request, response) => void this.handle(request, response));
+    this.server = createServer((request, response) => void this.handle(request, response).catch(() => undefined));
     await new Promise<void>((resolve, reject) => {
       this.server!.once("error", reject);
       this.server!.listen(0, "127.0.0.1", resolve);
@@ -160,6 +167,9 @@ export class FakeGitHub {
 
   async close(): Promise<void> {
     if (!this.server) return;
+    // Held (delayed) responses from cancellation scenarios must not keep the
+    // server open.
+    this.server.closeAllConnections();
     this.server.close();
     await once(this.server, "close");
     this.server = undefined;
@@ -178,9 +188,21 @@ export class FakeGitHub {
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    // An aborted client (cancel-during-write scenarios) destroys the socket
+    // while a delayed response is still pending; the write error must not
+    // surface as an unhandled event.
+    response.on("error", () => undefined);
     const url = new URL(request.url ?? "/", "http://fake-github.test");
     const path = url.pathname.replace(/^\/api\/v3/, "");
     this.requestLog.push({ method: request.method ?? "", path, accept: String(request.headers.accept ?? "") });
+    if (request.method === "POST" && this.state.delayNext.remaining > 0 && new RegExp(this.state.delayNext.match).test(path)) {
+      this.state.delayNext.remaining -= 1;
+      const hold = this.state.delayNext.ms;
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, hold);
+        timer.unref?.();
+      });
+    }
     if (request.method === "POST" && this.state.dropNextWrite.remaining > 0 && new RegExp(this.state.dropNextWrite.match).test(path)) {
       this.state.dropNextWrite.remaining -= 1;
       // Apply the write, then swallow the response (unknown outcome).
@@ -355,6 +377,7 @@ export class FakeGitHub {
         number: pull.number,
         state: pull.state,
         draft: pull.draft ?? false,
+        merged: pull.merged ?? false,
         head: { sha: pull.headSha, ref: pull.headRef ?? "feature", repo },
         base: { sha: pull.baseSha, ref: pull.baseRef ?? "main", repo: baseRepo },
       });

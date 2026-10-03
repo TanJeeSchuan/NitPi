@@ -30,6 +30,14 @@ import type { ReviewCommand } from "./review-task.js";
 /** Pull-request event the automatic mode can subscribe to. */
 export type PrAction = "opened" | "reopened" | "synchronize" | "ready_for_review";
 
+/**
+ * Pull-request events that STOP a run (ticket 09): the pull request closed
+ * (a normal close or one GitHub records after a successful merge) or was
+ * converted to a draft. They are delivered by the workflow (ticket 11), not
+ * subscribed to in automatic mode.
+ */
+export type PrStopAction = "closed" | "converted_to_draft";
+
 /** Check conclusions for refused triggers (spec: skipped or action required). */
 export type RefusalOutcome = "skipped" | "action_required";
 
@@ -40,7 +48,7 @@ export type TriggerEvent =
       repository: string;
       pullNumber: number;
       requester: string;
-      /** `/review`; `/review clean` and `/review cancel` are tickets 07/09. */
+      /** `/review`; `/review clean` queues; `/review cancel` stops the run. */
       command: "/review" | "/review clean" | "/review cancel";
       /** GitHub's comment or delivery id; redelivery of the same one deduplicates. */
       deliveryKey?: string;
@@ -53,11 +61,20 @@ export type TriggerEvent =
       sender: string;
       /** Optional workflow-supplied delivery id for deduplication. */
       deliveryKey?: string;
+    }
+  | {
+      kind: "pull-request-stop";
+      action: PrStopAction;
+      repository: string;
+      pullNumber: number;
+      sender: string;
+      deliveryKey?: string;
     };
 
 /** What the gate decided for a delivered trigger. */
 export type GateEvaluation =
   | { outcome: "start"; deliveryKey: string; request: GateStart }
+  | { outcome: "cancel"; deliveryKey: string; reason: string; requester: string }
   | {
       outcome: "refused";
       /** Explanation the requester sees as the check reason. */
@@ -78,6 +95,16 @@ export type GateEvaluation =
        * active run finishes (newest eligible head, runs coalesced). */
       outcome: "queued";
       deliveryKey: string;
+    }
+  | {
+      /** The pull request stopped (ticket 09): the active run is cancelled
+       * through the abort API with the durable fence, and the pending
+       * request is dropped. Delivery identity is recorded like every
+       * trigger's. */
+      outcome: "stop-cancelled";
+      deliveryKey: string;
+      reason: string;
+      requester: string;
     }
   | {
       /** A pending request exists but its review cannot start yet (named
@@ -287,7 +314,42 @@ export class TriggerGate {
 
   /** Entry for workflow subscribers: commands and pull-request events. */
   evaluate(event: TriggerEvent): Promise<GateEvaluation> {
-    return event.kind === "comment" ? this.evaluateCommand(event) : this.evaluatePrEvent(event);
+    if (event.kind === "comment") return this.evaluateCommand(event);
+    if (event.kind === "pull-request-stop") return this.evaluatePrStopEvent(event);
+    return this.evaluatePrEvent(event);
+  }
+
+  // -- stop events (ticket 09) ------------------------------------------------
+
+  /**
+   * The pull request closed (a plain close or the state GitHub records after
+   * a merge) or became a draft: the active run stops through the abort API
+   * with the durable fence, and the pending request is dropped (spec: the
+   * review's subject is gone; the newest queued head is stale together with
+   * the pull request's reviewability). Runs to completion regardless of
+   * whether a run was active — the stop state is recorded durably either
+   * way, so a redelivery cannot undo it, and a run whose start decision is
+   * still in the PR chain sees the fence when it starts publishing.
+   */
+  private async evaluatePrStopEvent(event: Extract<TriggerEvent, { kind: "pull-request-stop" }>): Promise<GateEvaluation> {
+    const key = prKey(event.repository, event.pullNumber);
+    const deliveryKey = eventKeyOf(event);
+    if (await this.delivered(deliveryKey)) return { outcome: "duplicate" };
+
+    // Record the delivery BEFORE the abort so a concurrent redelivery is a
+    // duplicate even while the abort is still joining.
+    await this.commitGateState((gate) => {
+      gate.delivered = [...gate.delivered, { key: deliveryKey, at: Date.now() }].slice(-DELIVERED_WINDOW);
+    });
+
+    const reason =
+      event.action === "closed"
+        ? `the pull request was closed by ${event.sender}; the active review is cancelled`
+        : `the pull request was converted to a draft by ${event.sender}; the active review is cancelled`;
+    await this.commitGateState((gate) => {
+      delete gate.pendingByPr[key];
+    });
+    return { outcome: "stop-cancelled", deliveryKey, reason, requester: event.sender };
   }
 
   // -- commands ----------------------------------------------------------------
@@ -355,22 +417,19 @@ export class TriggerGate {
       if (event.command === "/review clean") {
         return this.queueCommand(event, deliveryKey, headSha, isFork(body));
       }
-      // /review cancel behaves later (ticket 09); the gate recognises it but
-      // its run wiring is not built yet.
-      return {
-        outcome: "refused",
-        reason: `${event.command} is not wired yet (ticket 09)`,
-        checkOutcome: "action_required",
-        headSha,
-        baseSha,
-      };
+      // /review cancel (ticket 09): the writer decides to stop the active
+      // run. The host executes it (abort + durable fence).
+      return { outcome: "cancel", deliveryKey, reason: `${event.requester} commented "/review cancel"`, requester: event.requester };
     }
 
     if (event.command === "/review cancel") {
+      // Nothing active: refused with an explanation. The command starts
+      // nothing and touches nothing — the pending request and the delivery
+      // window stay as they are (ticket 09: cancel stops an active run).
       return {
         outcome: "refused",
-        reason: `${event.command} is not wired yet (ticket 09)`,
-        checkOutcome: "action_required",
+        reason: `no active review to cancel`,
+        checkOutcome: "skipped",
         headSha,
         baseSha,
       };
@@ -712,6 +771,21 @@ export class TriggerGate {
 
   // -- internals -------------------------------------------------------------------
 
+  /** Ticket 09: the host's cancellation executor reads the newest active
+   * run of one pull request after the command has passed the requester
+   * check. The same predicate every other lookup here uses. */
+  async findActiveRunAnyHead(
+    repository: string,
+    pullNumber: number,
+  ): Promise<RunDocument | undefined> {
+    return (await this.history.allRuns(TODO_CONTEXT)).find(
+      (r) =>
+        r.subject.repository === repository &&
+        r.subject.pullNumber === pullNumber &&
+        r.checkStatus === "in progress",
+    );
+  }
+
   private async snapshot(): Promise<GateRegistryState> {
     const doc = await this.harness.snapshot(GateRegistry, TODO_CONTEXT);
     return doc ?? { approvals: [], pendingByPr: {}, delivered: [] };
@@ -727,18 +801,6 @@ export class TriggerGate {
   private async delivered(deliveryKey: string): Promise<boolean> {
     const gate = await this.snapshot();
     return gate.delivered.some((d) => d.key === deliveryKey);
-  }
-
-  private async findActiveRunAnyHead(
-    repository: string,
-    pullNumber: number,
-  ): Promise<RunDocument | undefined> {
-    return (await this.history.allRuns(TODO_CONTEXT)).find(
-      (r) =>
-        r.subject.repository === repository &&
-        r.subject.pullNumber === pullNumber &&
-        r.checkStatus === "in progress",
-    );
   }
 
   private async findRunAnyStatus(
