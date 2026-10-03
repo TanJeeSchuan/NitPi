@@ -66,14 +66,20 @@ function assertHeadPresent(sourceRepo: string, headSha: string): void {
 function ensureWorktree(sourceRepo: string, path: string, headSha: string): void {
   mkdirSync(path, { recursive: true });
   if (readdirSync(path).length === 0) {
-    // Fresh directory: attach a detached worktree at the pinned head.
-    git(sourceRepo, ["worktree", "add", "--detach", path, headSha]);
+    attachWorktree(sourceRepo, path, headSha);
+    return;
   }
   const current = git(path, ["rev-parse", "HEAD"], true).trim();
   if (current !== headSha) {
-    // Stale or corrupted worktree: recreate from scratch.
+    // Stale or corrupted worktree: unregister, recreate, re-pin.
+    git(sourceRepo, ["worktree", "remove", "--force", path], true);
     rmSync(path, { recursive: true, force: true });
+    git(sourceRepo, ["worktree", "prune"], true);
     mkdirSync(path, { recursive: true });
-    git(sourceRepo, ["worktree", "add", "--detach", path, headSha]);
+    attachWorktree(sourceRepo, path, headSha);
   }
+}
+
+function attachWorktree(sourceRepo: string, path: string, headSha: string): void {
+  git(sourceRepo, ["worktree", "add", "--detach", path, headSha]);
 }

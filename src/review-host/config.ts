@@ -11,6 +11,11 @@
  */
 import type { StageConfig } from "../pi-bridge/provider-bridge.js";
 
+/** Shared full-commit-SHA predicate (trigger-gate SHAs and pinned revisions). */
+export function isFullSha(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{40}$/i.test(value);
+}
+
 /** One stage's resolved configuration. */
 export interface StageInput {
   /** Base URL of the stage's OpenAI-compatible endpoint. */
@@ -91,7 +96,7 @@ export function resolveConfig(input: ReviewHostConfig): ReviewHostConfig {
       "repositoryInstructions are required (captured from the main branch at a pinned revision)",
     );
   }
-  if (!/^[0-9a-f]{40}$/i.test(input.repositoryInstructionsRevision)) {
+  if (!isFullSha(input.repositoryInstructionsRevision)) {
     throw new ConfigError("repositoryInstructionsRevision must be a full commit SHA");
   }
   if (!input.headCheckoutSource) {

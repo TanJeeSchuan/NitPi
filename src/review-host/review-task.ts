@@ -25,7 +25,7 @@ import type { GitHubApi } from "../github/publisher.js";
 import { parseFinalReview } from "./artifact.js";
 import type { ReviewHostConfig } from "./config.js";
 import type { ResolvedInstructions } from "./instructions.js";
-import type { RunDocument, RunHistory } from "./run-history.js";
+import type { RunDocument, RunHistory, RunPhase } from "./run-history.js";
 
 export interface ReviewRunRequest {
   readonly repository: string;
@@ -220,18 +220,7 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
         );
       } catch (error) {
         const reason = error instanceof PublishError ? error.message : errorText(error);
-        try {
-          await publisher.checkFailure(subject, reason);
-        } catch {
-          // checkFailure failing must not mask the publication reason.
-        }
-        await commitRunUpdateSafe(host, task.input.runId, context, (run) => ({
-          ...run,
-          phase: "publishing",
-          checkStatus: "failure",
-          checkDetail: reason,
-          error: reason,
-        }));
+        await recordRunFailure(host, task.input.runId, context, reason, "publishing");
         await runtime.commit(
           (_tx) =>
             ({
@@ -267,8 +256,19 @@ async function failRun(
   context: Context,
   error: unknown,
 ): Promise<never> {
-  const host = reviewTaskDeps();
   const reason = errorText(error);
+  await recordRunFailure(reviewTaskDeps(), runId, context, reason);
+  throw error instanceof Error ? error : new Error(reason);
+}
+
+/** Shared failure bookkeeping: GitHub check failure + run document update. */
+async function recordRunFailure(
+  host: ReviewTaskDeps,
+  runId: string,
+  context: Context,
+  reason: string,
+  phase?: RunPhase,
+): Promise<void> {
   const runDoc = await host.runHistory.findRun(runId, context);
   try {
     if (runDoc) {
@@ -279,11 +279,11 @@ async function failRun(
   }
   await commitRunUpdateSafe(host, runId, context, (run) => ({
     ...run,
+    ...(phase ? { phase } : {}),
     checkStatus: "failure",
     checkDetail: reason,
     error: reason,
   }));
-  throw error instanceof Error ? error : new Error(reason);
 }
 
 async function commitRunUpdateSafe(
@@ -335,10 +335,9 @@ export interface TurnAnswer {
   usageSummary: { input: number; output: number; totalTokens: number };
 }
 
-/** Newest assistant entry with text, scanning newest-first. */
+/** Newest text-bearing assistant entry; entries() returns newest-first. */
 async function latestAssistant(conversation: Conversation, context: Context): Promise<TurnAnswer | undefined> {
   const page = await conversation.entries({ conversationId: conversation.id } as never, 20, undefined, context);
-  let newest: TurnAnswer | undefined;
   for (const entry of page.items) {
     if (entry.kind !== "pi.assistant") continue;
     for (const message of entry.model ?? []) {
@@ -348,7 +347,7 @@ async function latestAssistant(conversation: Conversation, context: Context): Pr
         .map((c) => c.text)
         .join("");
       if (text.trim()) {
-        newest = {
+        return {
           text,
           usageSummary: {
             input: message.usage.input,
@@ -356,11 +355,10 @@ async function latestAssistant(conversation: Conversation, context: Context): Pr
             totalTokens: message.usage.totalTokens,
           },
         };
-        break;
       }
     }
   }
-  return newest;
+  return undefined;
 }
 
 async function commitRunUpdate(

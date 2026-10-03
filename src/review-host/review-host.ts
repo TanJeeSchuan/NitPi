@@ -22,7 +22,7 @@ import { RestGitHubApi } from "../github/rest-api.js";
 import { Publisher } from "../github/publisher.js";
 import { createBridgedProvider } from "../pi-bridge/provider-bridge.js";
 import { ensureStageCheckouts, CheckoutError } from "./checkouts.js";
-import { resolveConfig, type ReviewHostConfig } from "./config.js";
+import { isFullSha, resolveConfig, type ReviewHostConfig } from "./config.js";
 import { resolveInstructions } from "./instructions.js";
 import { RunHistory, type RunDocument } from "./run-history.js";
 import { type GitHubApi } from "../github/publisher.js";
@@ -115,7 +115,6 @@ export async function openReviewHost(
 
 class ReviewHostImpl implements ReviewHost {
   private activeRuns = new Map<string, Promise<void>>();
-  private canonicalIds = new Map<string, string>();
 
   constructor(
     private readonly harness: Harness,
@@ -158,33 +157,38 @@ class ReviewHostImpl implements ReviewHost {
 
     const headSha = prBody.head?.sha;
     const baseSha = prBody.base?.sha;
-    if (!/^[0-9a-f]{40}$/i.test(headSha ?? "") || !/^[0-9a-f]{40}$/i.test(baseSha ?? "")) {
+    if (!isFullSha(headSha) || !isFullSha(baseSha)) {
       return { runId: "", refused: "pull request SHAs unavailable", conversationId: "" };
     }
 
     // At most one run per reviewed head: an in-progress run for the same head
     // satisfies the request instead of starting a second one.
+    const subject = {
+      repository: command.repository,
+      pullNumber: command.pullNumber,
+      baseSha: baseSha!,
+      headSha: headSha!,
+    };
     const existing = (await this.history.allRuns(context)).find(
-      (r) =>
-        r.subject.headSha === headSha &&
-        r.subject.pullNumber === command.pullNumber &&
-        r.checkStatus === "in progress",
+      (r) => r.subject.headSha === subject.headSha && r.checkStatus === "in progress",
     );
     if (existing) {
       return { runId: existing.runId, conversationId: existing.canonicalConversationId };
     }
 
     // Per-stage unchanged checkouts of the reviewed head.
-    const checkouts = ensureStageCheckouts(this.config.headCheckoutSource, headSha!);
+    const checkouts = ensureStageCheckouts(this.config.headCheckoutSource, subject.headSha);
 
     // The check shows in progress with the head and current stage while running.
-    await new Publisher(this.api).checkInProgress(
-      { repository: command.repository, pullNumber: command.pullNumber, baseSha: baseSha!, headSha: headSha! },
-      "primary",
-    );
+    await new Publisher(this.api).checkInProgress(subject, "primary");
 
-    const canonicalKey = `${command.repository}#${command.pullNumber}`;
-    let canonicalId = this.canonicalIds.get(canonicalKey);
+    // The canonical PR conversation is durable state, shared by every run of
+    // this PR (recovered from the runs registry on reopen).
+    let canonicalId = await this.history.findCanonicalConversation(
+      subject.repository,
+      subject.pullNumber,
+      context,
+    );
     if (!canonicalId) {
       const primaryInstructions = resolveInstructions("primary", this.config.repositoryInstructions);
       const canonical = await this.history.createCanonicalConversation(
@@ -192,11 +196,10 @@ class ReviewHostImpl implements ReviewHost {
         context,
       );
       canonicalId = canonical.id as unknown as string;
-      this.canonicalIds.set(canonicalKey, canonicalId);
     }
 
     const runId = `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-    const request = toRunRequest(command, baseSha!, headSha!);
+    const request = toRunRequest(subject);
     const started = await this.harness.commit(async (tx) => {
       const taskId = await tx.createTask(
         reviewTask,
@@ -209,12 +212,7 @@ class ReviewHostImpl implements ReviewHost {
         runId,
         mode: "normal",
         phase: "primary",
-        subject: {
-          repository: command.repository,
-          pullNumber: command.pullNumber,
-          baseSha: baseSha!,
-          headSha: headSha!,
-        },
+        subject,
         pipelineTaskId: taskId as unknown as string,
         canonicalConversationId: canonicalId!,
         artifactFrozen: false,
@@ -264,16 +262,12 @@ class ReviewHostImpl implements ReviewHost {
   }
 }
 
-function toRunRequest(
-  command: { repository: string; pullNumber: number },
-  baseSha: string,
-  headSha: string,
-): ReviewRunRequest {
+function toRunRequest(subject: RunDocument["subject"]): ReviewRunRequest {
   return {
-    repository: command.repository,
-    pullNumber: command.pullNumber,
-    baseSha,
-    headSha,
+    repository: subject.repository,
+    pullNumber: subject.pullNumber,
+    baseSha: subject.baseSha,
+    headSha: subject.headSha,
     command: "/review",
   };
 }
