@@ -30,11 +30,18 @@ export type RunPhase =
   | "publishing"
   | "published";
 
+/** Token usage of one settling assistant message. */
+export interface StageUsage {
+  input: number;
+  output: number;
+  totalTokens: number;
+}
+
 export interface RunUsage {
-  primary?: { input: number; output: number; totalTokens: number };
-  reReview?: { input: number; output: number; totalTokens: number };
+  primary?: StageUsage;
+  reReview?: StageUsage;
   /** The post-freeze matching turn (ticket 04). */
-  matching?: { input: number; output: number; totalTokens: number };
+  matching?: StageUsage;
 }
 
 export interface RunDocument {

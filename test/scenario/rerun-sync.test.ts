@@ -216,8 +216,14 @@ describe("scenario: reruns maintain findings across review threads (ticket 04)",
       const run1 = await latestRun(stage);
       const [c1, c2] = run1.publication!.commentIds as [number, number];
 
-      // Someone resolved the bot's first thread by hand between runs.
+      // Someone resolved the bot's first thread by hand between runs, and a
+      // person also replied under it.
       stage.fake.resolveThreadOfComment(c1, true);
+      const humanReply = stage.fake.addSeededComment(7, {
+        body: "Filed upstream — see #1201.",
+        author: "helper-human",
+        replyTo: c1,
+      });
       expect(stage.fake.threadForComment(c1)!.resolved).toBe(true);
 
       const run2Final = [RUN1_F1_SECTION, "", RUN1_F2_SECTION, "", RUN1_AUDIT].join("\n");
@@ -227,9 +233,12 @@ describe("scenario: reruns maintain findings across review threads (ticket 04)",
       // The recurring finding reopened its thread (GraphQL unresolve) and
       // updated the comment.
       expect(stage.fake.threadForComment(c1)!.resolved).toBe(false);
-      expect(stage.fake.prComments(7)).toHaveLength(2);
       const comments = stage.fake.prComments(7);
+      expect(comments.map((c) => c.id)).toEqual([c1, c2, humanReply.id]);
       expect(comments[0]!.body).toBe(RUN1_F1_SECTION);
+      // The person's reply is untouched even though it shares the thread.
+      expect(comments[2]!.body).toBe("Filed upstream — see #1201.");
+      expect(comments[2]!.author).toBe("helper-human");
       // The untouched second thread stays as it was.
       expect(stage.fake.threadForComment(c2)!.resolved).toBe(false);
 
@@ -340,14 +349,14 @@ describe("scenario: reruns maintain findings across review threads (ticket 04)",
       const [c1, c2] = run1.publication!.commentIds as [number, number];
 
       // Two people commented since: one on F1's anchor, one reply to it.
-      const humanRoot = stage.fake.addHumanComment(7, {
+      const humanRoot = stage.fake.addSeededComment(7, {
         path: "src/handler.ts",
         side: "RIGHT",
         line: 3,
         body: "I looked at this too — see the linked issue.",
         author: "helper-human",
       });
-      stage.fake.addHumanComment(7, { body: "Same here.", author: "other-human", replyTo: humanRoot.id });
+      stage.fake.addSeededComment(7, { body: "Same here.", author: "other-human", replyTo: humanRoot.id });
 
       const run2Final = [RUN1_F1_SECTION, "", RUN1_F2_SECTION, "", RUN1_AUDIT].join("\n");
       // A buggy match turn points at a human comment and at an ID that does
@@ -392,6 +401,109 @@ describe("scenario: reruns maintain findings across review threads (ticket 04)",
       expect(matchPrompt).toContain(`#${c1}`);
       expect(matchPrompt).not.toContain("I looked at this too");
       expect(matchPrompt).not.toContain("helper-human");
+    } finally {
+      await closeScenarioStage(stage);
+    }
+  });
+
+  it("a superseded comment is out of the matching pool: re-matching it is rejected and the banner survives", async () => {
+    const stage = await openStage(RUN1_PRIMARY, RUN1_REREVIEW);
+    try {
+      // Run 1: F1@3, F2@5.
+      await runReview(stage);
+      const run1 = await latestRun(stage);
+      const [c1, c2] = run1.publication!.commentIds as [number, number];
+
+      // Run 2: F1 moved to line 5 — run 2's replacement comment id is known
+      // only after the run; script run 3 from the fake afterwards.
+      const movedF1 = [
+        "## F1 — Unnecessary complexity: concatenation loop",
+        "",
+        "The finding still applies at the loop it now anchors. (Rechecked on rerun.)",
+        "",
+        "Evidence: the loop still rebuilds the result line by line.",
+        "src/handler.ts | RIGHT | 5",
+      ].join("\n");
+      const movedFinal = [movedF1, "", RUN1_F2_SECTION, "", RUN1_AUDIT].join("\n");
+      scriptRerun(stage, movedFinal, `F1 -> ${c1}\nF2 -> ${c2}\n`);
+      await runReview(stage);
+      const replacement = stage.fake.prComments(7).find((c) => c.id !== c1 && c.id !== c2)!.id;
+
+      // Run 3: the match turn (wrongly) points the still-current finding at
+      // the superseded comment instead of its replacement.
+      stage.primaryStub.append({ text: [RUN1_ARTIFACT], finishReason: "stop" as const });
+      stage.reReviewStub.append({ text: [movedFinal], finishReason: "stop" as const });
+      stage.reReviewStub.append({ text: [`F1 -> ${c1}\nF2 -> ${c2}\n`], finishReason: "stop" as const });
+      await runReview(stage);
+
+      const run3 = await latestRun(stage);
+      expect(run3.phase).toBe("published");
+      expect(run3.matchRejections).toEqual([
+        {
+          label: "F1",
+          commentId: c1,
+          reason: expect.stringContaining("was superseded earlier"),
+        },
+      ]);
+
+      // The superseded banner was not overwritten; the old thread carries it
+      // still, and the finding was published fresh instead.
+      const comments = stage.fake.prComments(7);
+      expect(comments.find((c) => c.id === c1)!.body).toContain("**Superseded:**");
+      // The run-2 replacement is untouched; run 3 posted a new comment at
+      // the current anchor alongside it.
+      expect(comments.find((c) => c.id === replacement)!.body).toBe(movedF1);
+      expect(comments.filter((c) => c.line === 5)).toHaveLength(3);
+      expect(comments).toHaveLength(4);
+
+      // The match pool excluded the superseded comment: the prompt listed the
+      // replacement, never the superseded id.
+      const match3Prompt = lastUserMessage(stage.reReviewStub.requests.at(-1)?.body.messages as never);
+      expect(match3Prompt).toContain(`#${replacement}`);
+      expect(match3Prompt).not.toContain(`#${c1}`);
+    } finally {
+      await closeScenarioStage(stage);
+    }
+  });
+
+  it("matches earlier bot comments even when no bot summary review exists", async () => {
+    // Odd state: bot threads exist but the summary review is gone (someone
+    // deleted it by hand). A run must still match and update the threads
+    // instead of re-posting everything.
+    const stage = await openStage(RUN1_PRIMARY, RUN1_REREVIEW);
+    try {
+      const seeded1 = stage.fake.addSeededComment(7, {
+        path: "src/handler.ts",
+        side: "RIGHT",
+        line: 3,
+        body: "## F1 — older text of the same finding",
+        author: "nitpi-reviewer[bot]",
+      });
+      const seeded2 = stage.fake.addSeededComment(7, {
+        path: "src/handler.ts",
+        side: "RIGHT",
+        line: 5,
+        body: "## F2 — older text of the same finding",
+        author: "nitpi-reviewer[bot]",
+      });
+
+      // The one run's scripts were handed to openStage; the match turn is
+      // appended now that the seeded comment ids are known.
+      stage.reReviewStub.append({ text: [`F1 -> ${seeded1.id}\nF2 -> ${seeded2.id}\n`], finishReason: "stop" as const });
+      await runReview(stage);
+
+      const run = await latestRun(stage);
+      expect(run.phase).toBe("published");
+      // Both earlier threads were updated in place — no duplicates.
+      const comments = stage.fake.prComments(7);
+      expect(comments.map((c) => c.id)).toEqual([seeded1.id, seeded2.id]);
+      expect(comments[0]!.body).toBe(RUN1_F1_SECTION);
+      expect(comments[1]!.body).toBe(RUN1_F2_SECTION);
+      // A summary review was created (body only) — one bot review total.
+      const reviews = stage.fake.publishedReviews(7);
+      expect(reviews).toHaveLength(1);
+      expect(reviews[0]!.comments).toHaveLength(0);
+      expect(reviews[0]!.body).toContain("2 findings");
     } finally {
       await closeScenarioStage(stage);
     }

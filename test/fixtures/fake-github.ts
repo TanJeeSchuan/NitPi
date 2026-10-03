@@ -446,8 +446,11 @@ export class FakeGitHub {
     };
   }
 
-  /** Test fixture: add a human-authored comment (root, or reply via `replyTo`). */
-  addHumanComment(
+  /** Test fixture: seed a comment directly in state (root, or reply via
+   * `replyTo`). The author decides whose comment it is — human logins for
+   * people's comments, the bot login to replicate bot output without a
+   * summary review. */
+  addSeededComment(
     pullNumber: number,
     input: { path?: string; side?: "LEFT" | "RIGHT"; line?: number; body: string; author: string; replyTo?: number },
   ): FakeReviewComment {

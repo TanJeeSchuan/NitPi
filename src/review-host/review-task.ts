@@ -28,12 +28,13 @@ import type { GitHubApi } from "../github/publisher.js";
 import { parseFinalReview } from "./artifact.js";
 import {
   buildMatchPrompt,
+  matchableComments,
   parseMatchList,
   type FindingMatch,
 } from "./matching.js";
 import type { ReviewHostConfig } from "./config.js";
 import type { ResolvedInstructions } from "./instructions.js";
-import type { RunDocument, RunHistory } from "./run-history.js";
+import type { RunDocument, RunHistory, StageUsage } from "./run-history.js";
 
 export interface ReviewRunRequest {
   readonly repository: string;
@@ -72,9 +73,6 @@ export interface ReviewTaskInput {
 export interface ReviewCheckpoint {
   phase: "primary" | "re-review" | "match" | "publish";
 }
-
-/** Usage of one settling assistant message. */
-type RunUsagePart = { input: number; output: number; totalTokens: number };
 
 export type ReviewTaskResult =
   | { readonly published: true; readonly reviewId: number }
@@ -209,8 +207,12 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
         const earlier = await publisher.listPublishedComments(runDoc.subject);
         const findings = runDoc.findings ?? [];
         const matches: FindingMatch[] = [];
-        let matchUsage: RunUsagePart | undefined;
+        let matchUsage: StageUsage | undefined;
         if (earlier.length > 0 && findings.length > 0) {
+          // A zero-finding rerun needs no matching turn: the publisher
+          // resolves every omitted bot thread at publish time. This turn
+          // runs only when there are findings to assign and something to
+          // assign them to.
           // One more turn in the SAME re-reviewer conversation; matching
           // only — it cannot change the frozen findings.
           if (!runDoc.reReviewConversationId) {
@@ -218,8 +220,13 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
           }
           const conversation = await harnessConversation(host.runHistory.harness, runDoc.reReviewConversationId);
           const botLogin = await publisher.botLogin();
-          const botComments = earlier.filter((c) => c.author === botLogin);
-          await runConversationTurn(conversation, buildMatchPrompt(findings, botComments), context);
+          // Only live bot thread roots are matchable: replies and comments
+          // the publisher already marked superseded are out of the pool.
+          await runConversationTurn(
+            conversation,
+            buildMatchPrompt(findings, matchableComments(earlier, botLogin)),
+            context,
+          );
           const answer = await latestAssistant(conversation, context);
           matches.push(...parseMatchList(answer?.text ?? "", new Set(findings.map((f) => f.label))).matches);
           matchUsage = answer?.usageSummary;

@@ -26,6 +26,8 @@ export interface PublishedComment {
   body: string;
   /** Author login on GitHub. */
   author: string;
+  /** Set when the comment is a reply inside another thread. */
+  inReplyToId?: number;
 }
 
 /** The model's assignment: label → earlier comment id, or null (no match). */
@@ -47,13 +49,30 @@ export interface ValidMatch {
   commentId: number;
 }
 
+/** First line of the banner the publisher writes on superseded comments.
+ * Detection keys on it so a superseded comment never re-enters the matching
+ * pool: its finding now lives at a different anchor. */
+export const SUPERSEDED_MARKER_PREFIX = "**Superseded:**";
+
+/** True when a publisher write marked this comment superseded earlier. */
+export function isSupersededComment(comment: PublishedComment): boolean {
+  return comment.body.startsWith(SUPERSEDED_MARKER_PREFIX);
+}
+
 /** Build the matching-only prompt for the frozen final review's findings.
  *
- * Only the reviewer bot's earlier comments are shown: they are the findings
- * the re-reviewer may assign to. Human comments are never offered as match
- * targets (and would be rejected by `validateMatches` if the model named one
- * anyway).
+ * Only the reviewer bot's earlier THREAD ROOT comments are shown, superseded
+ * ones excluded: they are the findings the re-reviewer may assign to. Human
+ * comments are never offered as match targets (and would be rejected by
+ * `validateMatches` if the model named one anyway).
  */
+export function matchableComments(comments: PublishedComment[], botLogin: string): PublishedComment[] {
+  return comments.filter(
+    (c) => c.author === botLogin && c.inReplyToId === undefined && !isSupersededComment(c),
+  );
+}
+
+/** Build the matching-only prompt for the frozen final review's findings. */
 export function buildMatchPrompt(findings: ReviewFinding[], earlierBotComments: PublishedComment[]): string {
   const current = findings
     .map((f) => `[ ${f.label} | ${f.path} | ${f.side} | ${f.line} ]\n${f.section}`)
@@ -114,9 +133,10 @@ export function parseMatchList(
 
 /** Validate raw model matches against the comments actually on this pull
  * request (the snapshot read at matching time). An ID is usable only when it
- * exists on this pull request AND was written by the reviewer bot; each
- * earlier comment can back at most one finding. Everything else is rejected
- * with a reason and never acted on. */
+ * exists on this pull request, was written by the reviewer bot on this pull
+ * request, is a thread root, and was not superseded earlier; each earlier
+ * comment can back at most one finding. Everything else is rejected with a
+ * reason and never acted on. */
 export function validateMatches(
   matches: FindingMatch[],
   earlier: PublishedComment[],
@@ -142,6 +162,22 @@ export function validateMatches(
         label: match.label,
         commentId: match.commentId,
         reason: `comment ${match.commentId} was not written by the reviewer bot (author: ${comment.author})`,
+      });
+      continue;
+    }
+    if (comment.inReplyToId !== undefined) {
+      rejections.push({
+        label: match.label,
+        commentId: match.commentId,
+        reason: `comment ${match.commentId} is a reply, not a thread root`,
+      });
+      continue;
+    }
+    if (isSupersededComment(comment)) {
+      rejections.push({
+        label: match.label,
+        commentId: match.commentId,
+        reason: `comment ${match.commentId} was superseded earlier; its replacement comment carries the finding`,
       });
       continue;
     }
