@@ -139,6 +139,8 @@ export interface GitHubApi {
 export interface HttpResponse {
   status: number;
   body: unknown;
+  /** Response headers (lower-cased), kept for `Retry-After` pacing. */
+  headers?: Record<string, string>;
 }
 
 export interface PublishedResult {

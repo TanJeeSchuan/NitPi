@@ -25,7 +25,7 @@ export class RestGitHubApi implements GitHubApi {
     body?: unknown,
     signal?: AbortSignal,
     options: { accept?: string; rawText?: boolean } = {},
-  ): Promise<{ status: number; body: T }> {
+  ): Promise<{ status: number; body: T; headers: Record<string, string> }> {
     return this.send<T>(method, `${this.normalizedBase}${path}`, body, signal, options);
   }
 
@@ -35,7 +35,7 @@ export class RestGitHubApi implements GitHubApi {
     body?: unknown,
     signal?: AbortSignal,
     options: { accept?: string; rawText?: boolean } = {},
-  ): Promise<{ status: number; body: T }> {
+  ): Promise<{ status: number; body: T; headers: Record<string, string> }> {
     const response = await fetch(url, {
       method,
       headers: {
@@ -49,7 +49,7 @@ export class RestGitHubApi implements GitHubApi {
     });
     const text = await response.text();
     const parsed = options.rawText ? (text as T) : text ? (JSON.parse(text) as T) : (undefined as T);
-    return { status: response.status, body: parsed };
+    return { status: response.status, body: parsed, headers: Object.fromEntries(response.headers) };
   }
 
   createReview(repository: string, pullNumber: number, payload: unknown, signal?: AbortSignal) {
