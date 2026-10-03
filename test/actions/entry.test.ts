@@ -16,6 +16,7 @@
  * (docs/actions-setup.md).
  */
 import { spawn } from "node:child_process";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { openScenarioJar, type ScenarioJar } from "../fixtures/scenario-jar.js";
@@ -75,6 +76,19 @@ interface EntryResult {
   readonly stderr: string;
 }
 
+/**
+ * The repository instructions file the workflow passes through
+ * `NITPI_REVIEW_INSTRUCTIONS_FILE`: written into the checkout the entry
+ * runs from (the child's cwd), so every child exercises the real file flow —
+ * there is no text override path.
+ */
+function provideInstructionsFile(jar: ScenarioJar, text: string): string {
+  const path = join(jar.repo.headCheckout(), ".nitpi", "review-instructions.md");
+  mkdirSync(join(path, ".."), { recursive: true });
+  writeFileSync(path, text);
+  return path;
+}
+
 /** Run the entry exactly the way the workflow's delivery step does (async:
  *  a synchronous spawn would block this process's event loop, and the stub
  *  and fake servers it must answer to run HERE). */
@@ -94,7 +108,7 @@ async function runEntry(jar: ScenarioJar, env: Record<string, string>): Promise<
     NITPI_INPUT_RE_REVIEW_BASE_URL: `${jar.stubBases.reReview}/v1`,
     NITPI_INPUT_RE_REVIEW_MODEL_ID: "stub-scenario-rereview",
     NITPI_INPUT_REVIEW_INSTRUCTIONS_REVISION: jar.baseSha,
-    NITPI_REVIEW_INSTRUCTIONS: "Be strict about unused parameters.",
+    NITPI_REVIEW_INSTRUCTIONS_FILE: provideInstructionsFile(jar, "Be strict about unused parameters."),
     GITHUB_API_BASE_URL: jar.githubBase,
     NITPI_INPUT_PRIMARY_DEADLINE_MS: "120000",
     NITPI_INPUT_RE_REVIEW_DEADLINE_MS: "120000",
@@ -181,11 +195,17 @@ describe("entry point: configuration failures exit 2 before anything runs", () =
     NITPI_SECRET_STORAGE_AUTH_KEY: "k",
     NITPI_SECRET_GITHUB_TOKEN: "t",
     NITPI_INPUT_REVIEW_INSTRUCTIONS_REVISION: "0011223344556677889900112233445566778899",
-    NITPI_REVIEW_INSTRUCTIONS: "Be strict.",
   };
 
   function runWith(jar: ScenarioJar, overrides: Record<string, string>): Promise<EntryResult> {
-    return runEntry(jar, { ...base, ...overrides });
+    // The instructions file is provided per jar (the child's cwd), so the
+    // configuration failures below are the one the test targets, not the
+    // missing-instructions error that resolveConfig reports first.
+    return runEntry(jar, {
+      ...base,
+      NITPI_REVIEW_INSTRUCTIONS_FILE: provideInstructionsFile(jar, "Be strict."),
+      ...overrides,
+    });
   }
 
   it("fails when a required input is missing", { timeout: 60_000 }, async () => {

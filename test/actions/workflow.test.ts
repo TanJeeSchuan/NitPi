@@ -7,7 +7,9 @@
  * to violate. Those are pinned here, cheaply and textually:
  *
  * - the workflow triggers on the issue-comment and pull_request_target
- *   events only, with the six actions the host accepts;
+ *   events (plus the check_run clock that re-kicks a durable pending
+ *   request after its named-check wait deferred), with the six actions the
+ *   host accepts;
  * - the workflow definition and the checked-out code come from the default
  *   branch (a PR cannot change the workflow that gates it);
  * - the default token's permissions are minimal; writes go through the
@@ -42,9 +44,13 @@ function normalized(text: string): string {
 const WORKFLOW_TEXT = normalized(WORKFLOW);
 
 describe("workflow trust pins (ticket 11)", () => {
-  it("triggers on issue-comment and pull_request_target only, with the six accepted actions", () => {
+  it("triggers on issue-comment, pull_request_target and the check-run clock, with the six accepted actions", () => {
     expect(WORKFLOW_TEXT).toContain("issue_comment:");
     expect(WORKFLOW_TEXT).toContain("pull_request_target:");
+    // The check-run clock: a durable pending request's named-check wait is
+    // re-kicked when a watched check completes (ticket 03's re-kick).
+    expect(WORKFLOW_TEXT).toContain("check_run:");
+    expect(WORKFLOW_TEXT).toContain("types: [completed]");
     for (const action of [
       "opened", "reopened", "synchronize", "ready_for_review", "closed", "converted_to_draft",
     ]) {

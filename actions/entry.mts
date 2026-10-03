@@ -238,15 +238,14 @@ function positiveMs(name: string, fallback: number): number {
  * default-branch checkout provides, mapped through
  * `NITPI_REVIEW_INSTRUCTIONS_FILE`, with the pinned revision carried
  * separately (`NITPI_INPUT_REVIEW_INSTRUCTIONS_REVISION`) and recorded
- * verbatim on every run document. An absent or empty file is an empty
- * instructions layer.
+ * verbatim on every run document. An absent or empty file yields empty
+ * instructions text, which resolveConfig rejects as a configuration error
+ * before anything runs — a repository without the file has no reviewer.
  */
-function repositoryInstructions(): string {
-  const path = env("NITPI_REVIEW_INSTRUCTIONS_FILE");
+function readInstructionsFile(path?: string): string {
   if (!path) return "";
   try {
-    const text = readFileSync(path, "utf8");
-    return text.trim() === "" ? "" : text;
+    return readFileSync(path, "utf8");
   } catch {
     return "";
   }
@@ -264,10 +263,7 @@ function buildStage(stage: "PRIMARY" | "RE_REVIEW"): StageInput {
 
 /**
  * Build and validate the whole host config (`.resolveConfig`'s order:
- * shape first, then one error at a time). `NITPI_REVIEW_INSTRUCTIONS`
- * optionally overrides the file read — not trusted configuration flow but
- * a setup-note convenience for your own re-comment command debug invocations,
- * never reachable from a pull request.
+ * shape first, then one error at a time).
  */
 export function buildConfig(): ReviewHostConfig {
   const repository = env("GITHUB_REPOSITORY");
@@ -286,22 +282,12 @@ export function buildConfig(): ReviewHostConfig {
     githubBaseUrl: env("GITHUB_API_BASE_URL") ?? "https://api.github.com",
     primary: buildStage("PRIMARY"),
     reReview: buildStage("RE_REVIEW"),
-    repositoryInstructions: env("NITPI_REVIEW_INSTRUCTIONS")
-      ?? readInstructionsFile(env("NITPI_REVIEW_INSTRUCTIONS_FILE")),
+    repositoryInstructions: readInstructionsFile(env("NITPI_REVIEW_INSTRUCTIONS_FILE")),
     repositoryInstructionsRevision: requiredInput("REVIEW_INSTRUCTIONS_REVISION"),
     headCheckoutSource: process.cwd(),
     autoMode: autoModeInput(),
     refusalCheckBehavior: refusalCheckBehaviorInput(),
   });
-}
-
-function readInstructionsFile(path?: string): string {
-  if (!path) return "";
-  try {
-    return readFileSync(path, "utf8");
-  } catch {
-    return "";
-  }
 }
 
 type Invocation = "issue-comment" | "pull-request" | "check-run-rekick";

@@ -43,8 +43,10 @@ review policy is not reviewable) and fails the run before any model call.
 An endpoint lacking streaming or tool calls fails with an explicit
 configuration error; there is no fallback model.
 
-The workflow also reads one repository variable, `NITPI_TAILSCALE_TAG`
-(default `tag:ci-nitpi-reviewer`), used when joining the tailnet.
+The workflow also carries one non-`NITPI_INPUT_` setting in its `env` block:
+`NITPI_TAILSCALE_TAG` (default `tag:ci-nitpi-reviewer`), the tag the runner
+advertises when joining the tailnet. It must match the tag assigned to the
+Tailscale OAuth client (section 3).
 
 ## 2. GitHub secrets
 
@@ -108,7 +110,7 @@ npm ci
 export NITPI_STORAGE_DATA_DIR=/srv/nitpi-storage
 export NITPI_STORAGE_AUTH_TOKEN="$(openssl rand -hex 32)"   # same value as NITPI_STORAGE_AUTH_KEY
 export NITPI_STORAGE_PORT=51733
-# Bind the tailnet interface so only tailnet peers can connect at all
+# Bind the tailnet interface only, so only tailnet peers can connect at all
 # (the ACL above is the second boundary; this is the first):
 export NITPI_STORAGE_HOST=<homeserver-tailscale-ip>
 npx tsx src/storage/service-main.ts
