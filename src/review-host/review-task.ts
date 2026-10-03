@@ -75,7 +75,9 @@
  * (its signal is cancelled) and, even if the GitHub write itself landed,
  * the run records itself as cancelled — never as a completed result. A run
  * cancelled before publication was attempted shows no check at all; the
- * cancellation itself surfaces through the check channel.
+ * cancellation itself surfaces through the check channel. Publication is
+ * inline in the publish phase (there is no publication child task); the
+ * fence covers the in-flight write the same way it would cover one.
  */
 import type { Context } from "@earendil-works/chord";
 import { TODO_CONTEXT } from "@earendil-works/chord/context";
@@ -592,9 +594,7 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
           checkStatus: "cancelled" as const,
           checkDetail: reason,
         }));
-        await new Publisher(host.api)
-          .checkCancelled(run.subject, reason)
-          .catch(() => undefined);
+        await postCancelledCheck(host, run.subject, reason);
       }
     } catch {
       // Storage unreachable: the task still ends below; the run document
@@ -755,10 +755,7 @@ async function finishCancelled(
       baseSha: task.input.request.baseSha,
       headSha: task.input.request.headSha,
     };
-  // The run's own check channel, not a publication: same as checkFailure.
-  await new Publisher(host.api)
-    .checkCancelled(subject, error.reason)
-    .catch(() => undefined);
+  await postCancelledCheck(host, subject, error.reason);
   await runtime.commit(
     (_tx) =>
       ({
@@ -770,6 +767,16 @@ async function finishCancelled(
       }) as const,
     context,
   );
+}
+
+/**
+ * The cancelled run's GitHub check (ticket 09): the run's own status
+ * channel — same as checkFailure/checkIncomplete, not a publication (no
+ * review, comment or thread write). A failed check write must not mask the
+ * recorded cancellation.
+ */
+async function postCancelledCheck(host: ReviewTaskDeps, subject: RunDocument["subject"], reason: string): Promise<void> {
+  await new Publisher(host.api).checkCancelled(subject, reason).catch(() => undefined);
 }
 
 /**

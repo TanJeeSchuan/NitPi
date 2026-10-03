@@ -423,19 +423,15 @@ export class TriggerGate {
     }
 
     if (event.command === "/review cancel") {
-      // Nothing active: the command is refused with an explanation instead of
-      // being recorded as delivering a cancellation (and it must not poison
-      // later `/review` deliveries through the dedup window).
-      const refusedCheck = { outcome: "refused" as const, checkOutcome: "skipped" as const, headSha, baseSha };
-      const queued = (await this.snapshot()).pendingByPr[prKey(event.repository, event.pullNumber)];
-      if (queued) {
-        // A pending request behind the finished run is dropped too: the
-        // newest command asked to cancel.
-        await this.consumePending(prKey(event.repository, event.pullNumber));
-      }
+      // Nothing active: refused with an explanation. The command starts
+      // nothing and touches nothing — the pending request and the delivery
+      // window stay as they are (ticket 09: cancel stops an active run).
       return {
-        ...refusedCheck,
-        reason: `no active review to cancel${queued ? " (the queued review request was also dropped)" : ""}`,
+        outcome: "refused",
+        reason: `no active review to cancel`,
+        checkOutcome: "skipped",
+        headSha,
+        baseSha,
       };
     }
 
@@ -775,11 +771,19 @@ export class TriggerGate {
 
   // -- internals -------------------------------------------------------------------
 
-  /** Ticket 09: the host's cancellation executor needs the newest active
+  /** Ticket 09: the host's cancellation executor reads the newest active
    * run of one pull request after the command has passed the requester
-   * check. Deliberately the same predicate as the host's own lookups. */
-  async findActiveRun(repository: string, pullNumber: number): Promise<RunDocument | undefined> {
-    return this.findActiveRunAnyHead(repository, pullNumber);
+   * check. The same predicate every other lookup here uses. */
+  async findActiveRunAnyHead(
+    repository: string,
+    pullNumber: number,
+  ): Promise<RunDocument | undefined> {
+    return (await this.history.allRuns(TODO_CONTEXT)).find(
+      (r) =>
+        r.subject.repository === repository &&
+        r.subject.pullNumber === pullNumber &&
+        r.checkStatus === "in progress",
+    );
   }
 
   private async snapshot(): Promise<GateRegistryState> {
@@ -797,18 +801,6 @@ export class TriggerGate {
   private async delivered(deliveryKey: string): Promise<boolean> {
     const gate = await this.snapshot();
     return gate.delivered.some((d) => d.key === deliveryKey);
-  }
-
-  private async findActiveRunAnyHead(
-    repository: string,
-    pullNumber: number,
-  ): Promise<RunDocument | undefined> {
-    return (await this.history.allRuns(TODO_CONTEXT)).find(
-      (r) =>
-        r.subject.repository === repository &&
-        r.subject.pullNumber === pullNumber &&
-        r.checkStatus === "in progress",
-    );
   }
 
   private async findRunAnyStatus(

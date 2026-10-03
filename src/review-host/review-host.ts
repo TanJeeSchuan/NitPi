@@ -649,13 +649,13 @@ class ReviewHostImpl implements ReviewHost {
     conversationId: string;
     outcome?: GateEvaluation["outcome"];
   }> {
-    const active = await this.gate.findActiveRun(this.config.repository, this.config.pullNumber);
+    const active = await this.gate.findActiveRunAnyHead(this.config.repository, this.config.pullNumber);
     if (!active) {
       // The run ended while the requester was being permission-checked:
       // refusal with a reason, no fence, no check.
       return { runId: "", refused: "no active review to cancel", conversationId: "", outcome: "refused" };
     }
-    await this.recordCancellation(active, reason, by);
+    await this.recordCancellation(active, { by, reason });
     return { runId: active.runId, conversationId: active.canonicalConversationId, outcome: "cancel" };
   }
 
@@ -665,14 +665,20 @@ class ReviewHostImpl implements ReviewHost {
    * abort waits out the active run invocation before it returns, so this
    * resolves with the run interrupted exactly like a host crash.
    */
-  private async recordCancellation(run: RunDocument, reason: string, by: string): Promise<void> {
+  private async recordCancellation(
+    run: RunDocument,
+    cancellation: { by: string; reason: string },
+  ): Promise<void> {
     // Fence in the same parallel step: it must be committed before the abort
     // invocation runs (its protocol check reads the fence), but concurrent
     // triggers are held by the PR chain while this chain runs.
     const [abortResult] = await Promise.all([
-      this.harness.abortTask(run.pipelineTaskId as never, TODO_CONTEXT).catch(() => "marked" as const),
-      this.fenceRun(run, reason, by),
+      this.harness.abortTask(run.pipelineTaskId as never, TODO_CONTEXT).catch(() => "settled" as const),
+      this.fenceRun(run, cancellation),
     ]);
+    // The fence is the authoritative stop (every phase turn reads it), so an
+    // abortTask failure only means the task had already settled — there was
+    // nothing left to interrupt and there is nothing to wait on.
     if (abortResult === "marked") {
       // The abort invocation runs after this commit; the tracked wait keeps
       // the host's drain loop / waitForRun semantics working as with any run.
@@ -688,14 +694,14 @@ class ReviewHostImpl implements ReviewHost {
    * cannot be skipped: storage being down means the fence cannot be recorded
    * and the host surfaces the failure instead of pretending it cancelled.
    */
-  private async fenceRun(run: RunDocument, reason: string, by: string): Promise<void> {
+  private async fenceRun(run: RunDocument, cancellation: { by: string; reason: string }): Promise<void> {
     await this.harness.commit(async (tx) => {
       const current = await this.history.findRunInTx(tx, run.runId);
       if (!current) return; // Nothing readable: no fence elsewhere anyway.
       if (current.cancelled) return; // A prior event already fenced it.
       await this.history.record(tx, {
         ...current,
-        cancelled: { by, reason, at: Date.now() },
+        cancelled: { ...cancellation, at: Date.now() },
       });
     }, TODO_CONTEXT);
   }

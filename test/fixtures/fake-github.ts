@@ -21,6 +21,8 @@ export interface FakePullRequest {
   state: "open" | "closed";
   /** Draft pull requests get no automatic review (ticket 03). */
   draft?: boolean;
+  /** GitHub records a merged pull request as state "closed" (ticket 09). */
+  merged?: boolean;
   /** Head repository full name; differs from `baseRepo` on fork pulls. */
   headRepo?: string;
   baseRepo?: string;
@@ -375,6 +377,7 @@ export class FakeGitHub {
         number: pull.number,
         state: pull.state,
         draft: pull.draft ?? false,
+        merged: pull.merged ?? false,
         head: { sha: pull.headSha, ref: pull.headRef ?? "feature", repo },
         base: { sha: pull.baseSha, ref: pull.baseRef ?? "main", repo: baseRepo },
       });

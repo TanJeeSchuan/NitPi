@@ -321,7 +321,7 @@ describe("scenario: cancelling a review actually stops it (ticket 09)", () => {
 
         // Hold the publication write: the run reaches the publish phase and
         // its review POST is in flight when the cancel lands.
-        stage.fake.state.delayNext = { match: /reviews$/, ms: 5_000, remaining: 1 };
+        stage.fake.state.delayNext = { match: /reviews$/, ms: 600, remaining: 1 };
         await waitFor(() =>
           stage.fake.requestLog.some((entry) => entry.method === "POST" && entry.path.endsWith("/reviews"))
             ? true
@@ -343,6 +343,13 @@ describe("scenario: cancelling a review actually stops it (ticket 09)", () => {
         const checks = checksForHead(stage, repo.headSha);
         expect(checks.some((c) => c.state === "success")).toBe(false);
         expect(checks.at(-1)).toMatchObject({ state: "cancelled" });
+
+        // The in-flight write never landed: the review POST arrived (the
+        // write was genuinely in flight), the client aborted it during the
+        // hold, and once the hold has passed the fake still holds no review.
+        expect(stage.fake.requestLog.some((e) => e.method === "POST" && e.path.endsWith("/reviews"))).toBe(true);
+        await new Promise((resolve) => setTimeout(resolve, 1_200));
+        expect(stage.fake.publishedReviews(7)).toHaveLength(0);
       },
     );
   }, 60_000);
@@ -441,6 +448,47 @@ describe("scenario: cancelling a review actually stops it (ticket 09)", () => {
         expect(run.phase).toBe("cancelled");
         expect(run.checkStatus).toBe("cancelled");
         expect(run.cancelled?.reason).toContain("draft");
+        expect(stage.fake.publishedReviews(7)).toHaveLength(0);
+        expect(checksForHead(stage, repo.headSha).at(-1)).toMatchObject({ state: "cancelled" });
+      },
+    );
+  }, 60_000);
+
+  it("a merge (the closed state GitHub records) cancels the active run", async () => {
+    await withStage(
+      {
+        pull: { merged: true },
+        primaryScript: [
+          { ...READ_TURN, delayMs: 800 },
+          ...ONE_REVIEW_PRIMARY.slice(1),
+        ],
+        reReviewScript: ONE_REVIEW_REREVIEW,
+      },
+      async (stage) => {
+        const started = await stage.host.handleReviewCommand({
+          repository: "example/widgets",
+          pullNumber: 7,
+          requester: "octocat",
+          deliveryKey: "t09-merge-command",
+        });
+        expect(started.runId).toBeTruthy();
+
+        await waitFor(() => (stage.primaryStub.served >= 1 ? true : undefined));
+        // A merge is delivered as the same `closed` action GitHub sends.
+        const stop = await stage.host.handlePullRequestEvent({
+          action: "closed",
+          repository: "example/widgets",
+          pullNumber: 7,
+          sender: "octocat",
+          deliveryKey: "t09-merge-event",
+        });
+        expect(stop.outcome).toBe("stop-cancelled");
+        await stage.host.waitForRun(started.runId);
+
+        const run = await awaitRunTerminal(stage.host, started.runId);
+        expect(run.phase).toBe("cancelled");
+        expect(run.checkStatus).toBe("cancelled");
+        expect(run.publication).toBeUndefined();
         expect(stage.fake.publishedReviews(7)).toHaveLength(0);
         expect(checksForHead(stage, repo.headSha).at(-1)).toMatchObject({ state: "cancelled" });
       },
