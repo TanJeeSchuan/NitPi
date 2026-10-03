@@ -72,7 +72,7 @@ import {
  * not a blind create retry — decides what happened. */
 export class WriteOutcomeUnknown extends Error {
   constructor(message: string) {
-    super(message);
+    super(`${message} — its outcome stays unknown; reconciliation is retried later instead of creating again`);
     this.name = "WriteOutcomeUnknown";
   }
 }

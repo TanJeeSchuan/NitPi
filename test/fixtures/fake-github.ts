@@ -82,8 +82,9 @@ export interface FakeGitHubState {
   dropNextWrite: { match: RegExp; remaining: number };
   /** Scripted refusals: the write is NOT applied; the response carries the
    * status (and a `Retry-After` header when set) — ticket 05's rate-limit
-   * and permission scenarios. */
-  refuseNextWrite: { match: RegExp; remaining: number; status: number; retryAfter?: number; message?: string };
+   * and permission scenarios. `methods` narrows which verbs refuse (writes
+   * by default; pass `["GET"]` to refuse a reconciliation read). */
+  refuseNextWrite: { match: RegExp; remaining: number; status: number; retryAfter?: number; message?: string; methods?: string[]; /** Matches to pass through before the refusals start firing. */ skip?: number };
   /** When set, list endpoints never serve more items per page than this,
    * regardless of the requested `per_page` — the pagination exercise. */
   enforceListPageSize?: number;
@@ -191,8 +192,13 @@ export class FakeGitHub {
   private scriptedRefusal(request: IncomingMessage, path: string): boolean {
     const scripted = this.state.refuseNextWrite;
     if (scripted.remaining <= 0) return false;
-    if (!["POST", "PATCH", "PUT"].includes(request.method ?? "")) return false;
+    const methods = scripted.methods ?? ["POST", "PATCH", "PUT"];
+    if (!methods.includes(request.method ?? "")) return false;
     if (!new RegExp(scripted.match).test(path)) return false;
+    if ((scripted.skip ?? 0) > 0) {
+      scripted.skip = (scripted.skip ?? 0) - 1;
+      return false;
+    }
     scripted.remaining -= 1;
     return true;
   }
@@ -577,6 +583,8 @@ export class FakeGitHub {
   private toRestReview(review: FakeReview): Record<string, unknown> {
     return {
       ...review,
+      // Real GitHub serves snake_case on the wire.
+      commit_id: review.commitId,
       user: { login: review.author },
       comments: review.comments.map((c) => this.toRestComment(c)),
     };
@@ -597,6 +605,26 @@ export class FakeGitHub {
       in_reply_to_id: comment.inReplyToId,
       pull_request_review_id: comment.reviewId,
     };
+  }
+
+  /** Test fixture: seed a submitted review directly in state (any author;
+   * the reviewer bot's login replicates bot output without a create). */
+  addSeededReview(
+    pullNumber: number,
+    input: { body: string; commitId?: string; author?: string; event?: FakeReview["event"] },
+  ): FakeReview {
+    const id = ++this.reviewsSeq;
+    const review: FakeReview = {
+      id,
+      pullNumber,
+      commitId: input.commitId ?? this.state.pulls[pullNumber]?.headSha ?? "",
+      event: input.event ?? "COMMENT",
+      body: input.body,
+      author: input.author ?? this.botLogin,
+      comments: [],
+    };
+    this.state.reviews.push(review);
+    return review;
   }
 
   /** Test fixture: seed a comment directly in state (root, or reply via
