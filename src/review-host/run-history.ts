@@ -20,6 +20,7 @@ import {
 } from "@earendil-works/pi-durable";
 import type { ReviewFinding } from "./artifact.js";
 import type { FindingMatch, MatchRejection, PublishedComment } from "./matching.js";
+import type { ResolvedInstructions } from "./instructions.js";
 
 export type RunPhase =
   | "primary"
@@ -42,6 +43,18 @@ export interface RunUsage {
   reReview?: StageUsage;
   /** The post-freeze matching turn (ticket 04). */
   matching?: StageUsage;
+}
+
+/** One stage's resolved instructions as stored on the run document (ticket 10). */
+export interface StageInstructionsRecord {
+  /** The full resolved instruction block the stage ran with. */
+  readonly text: string;
+  /** Pin provenance of the review-policy layer (the built-in skill's pin). */
+  readonly policyPin: string;
+  /** How the custom prompt was applied: `append`, `replace`, or none. */
+  readonly promptMode: "append" | "replace" | "none";
+  /** The custom prompt text resolved into the instructions, when any. */
+  readonly customPrompt?: string;
 }
 
 export interface RunDocument {
@@ -90,6 +103,16 @@ export interface RunDocument {
   matchRejections?: MatchRejection[];
   /** The instructions each stage actually used, by content hash. */
   instructionHashes?: { primary?: string; reReview?: string };
+  /**
+   * The instructions each stage actually used, resolved once at run start
+   * (ticket 10). Recovery reuses these even when the configuration changed
+   * mid-run. `promptMode` distinguishes default policy runs (`none`) from
+   * append/replace runs.
+   */
+  resolvedInstructions?: {
+    primary?: StageInstructionsRecord;
+    reReview?: StageInstructionsRecord;
+  };
   /** Pinned revision the repository instructions were captured at. */
   repositoryInstructionsRevision?: string;
   /** Per-stage unchanged checkouts of the reviewed head. */
@@ -151,6 +174,20 @@ export class RunHistory {
     return run?.canonicalConversationId;
   }
 
+  /**
+   * The stored instructions a stage of one run actually used (ticket 10).
+   * Recovery reads from the run document, not the live configuration, so a
+   * mid-run configuration change cannot alter an in-progress run.
+   */
+  async instructionsFor(
+    runId: string,
+    role: "primary" | "re-review",
+    context: Context,
+  ): Promise<StageInstructionsRecord | undefined> {
+    const run = await this.findRun(runId, context);
+    return stageInstructionsRecord(run?.resolvedInstructions, role);
+  }
+
   async createCanonicalConversation(
     agent: { modelId: string; instructions: string },
     context: Context,
@@ -173,3 +210,11 @@ export class RunHistory {
 }
 
 export type { ConversationId };
+
+/** One stage's record out of a run document's stored resolutions. */
+export function stageInstructionsRecord(
+  stored: { primary?: StageInstructionsRecord; reReview?: StageInstructionsRecord } | undefined,
+  role: "primary" | "re-review",
+): StageInstructionsRecord | undefined {
+  return role === "primary" ? stored?.primary : stored?.reReview;
+}

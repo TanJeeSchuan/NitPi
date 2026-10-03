@@ -4,8 +4,10 @@
  * Phases (pipeline, spec "Pi Durable mapping"):
  *   primary → freeze artifact → re-review → final frozen → publish → published
  *
- * Instructions per stage come from the resolved protocol + policy +
- * repository layers (instructions.ts). The primary turn runs in the canonical
+ * Instructions per stage come from the run document's stored resolution
+ * (protocol + policy + repository layers, resolved once at command time;
+ * ticket 10), never from the live configuration — recovery reuses the stored
+ * text even if the configuration changed mid-run. The primary turn runs in the canonical
  * PR conversation; the re-reviewer runs in a task-owned conversation (reused
  * when an interrupted attempt already recorded one) with explicit agent
  * configuration, on its own unchanged checkout. It receives the frozen
@@ -67,7 +69,14 @@ import {
 } from "./matching.js";
 import type { ReviewHostConfig } from "./config.js";
 import type { ResolvedInstructions } from "./instructions.js";
-import type { RunDocument, RunHistory, RunPhase, RunUsage, StageUsage } from "./run-history.js";
+import type {
+  RunDocument,
+  RunHistory,
+  RunPhase,
+  RunUsage,
+  StageInstructionsRecord,
+  StageUsage,
+} from "./run-history.js";
 
 export interface ReviewRunRequest {
   readonly repository: string;
@@ -87,7 +96,6 @@ export interface ReviewTaskDeps {
   readonly config: ReviewHostConfig;
   readonly runHistory: RunHistory;
   readonly api: GitHubApi;
-  getInstructions(role: "primary" | "re-review"): ResolvedInstructions;
   /** Duration in milliseconds after which a stage fails as incomplete. */
   stageDeadline(stage: "primary" | "re-review"): number;
 }
@@ -143,9 +151,10 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
           return;
         }
 
-        // Primary instructions: protocol + policy + repository layers, with
-        // the content hash recorded on the run document.
-        const instructions = host.getInstructions("primary");
+        // Primary instructions: the run's stored resolution (protocol +
+        // policy + repository layers, plus the custom prompt in append or
+        // replace mode), with the content hash recorded on the run document.
+        const instructions = await instructionsForStage(host, "primary", runDoc, context);
         await configureConversation(
           canonical,
           "nitpi-primary",
@@ -232,7 +241,7 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
           }, context);
           conversation = await harnessConversation(host.runHistory.harness, createdId!);
         }
-        const instructions = host.getInstructions("re-review");
+        const instructions = await instructionsForStage(host, "re-review", runDoc, context);
         await configureConversation(
           conversation,
           "nitpi-re-review",
@@ -526,6 +535,39 @@ async function runConversationTurn(
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+/**
+ * Ticket 10: the instructions one stage runs with — the run document's stored
+ * resolution, written at command time before any model call. There is no
+ * fallback: a run whose document has no stored instructions is corrupt, and
+ * re-resolving from the live configuration would let a mid-run configuration
+ * change alter a run already in progress.
+ */
+async function instructionsForStage(
+  host: ReviewTaskDeps,
+  role: "primary" | "re-review",
+  runDoc: RunDocument,
+  context: Context,
+): Promise<ResolvedInstructions> {
+  const stored = await host.runHistory.instructionsFor(runDoc.runId, role, context);
+  if (!stored) {
+    throw new Error(`run ${runDoc.runId} has no stored ${role} instructions (corrupt run document)`);
+  }
+  return storedInstructionsToResolved(stored);
+}
+
+/** A stored record is the same shape the resolver produces. */
+function storedInstructionsToResolved(stored: StageInstructionsRecord): ResolvedInstructions {
+  if (stored.promptMode !== "append" && stored.promptMode !== "replace" && stored.promptMode !== "none") {
+    throw new Error(`stored instructions for the stage have an unknown prompt mode: ${String(stored.promptMode)}`);
+  }
+  return {
+    text: stored.text,
+    policyPin: stored.policyPin,
+    promptMode: stored.promptMode,
+    ...(stored.customPrompt !== undefined ? { customPrompt: stored.customPrompt } : {}),
+  };
 }
 
 /** Record a stage failure on the run document and GitHub, then rethrow so the
