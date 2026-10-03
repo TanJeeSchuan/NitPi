@@ -48,7 +48,7 @@ import {
   PublicationLedger,
   bodyWithMarker,
   extractMarkers,
-  nextRecreateOrdinal,
+  nextCreateOrdinal,
   operationKey,
   findingMarker,
   recreateOperationKey,
@@ -665,7 +665,7 @@ export class Publisher {
     const hooks = this.ledgerHooks;
     if (hooks) {
       const ops = await hooks.ledger.opsForRun(runId, hooks.context);
-      ordinal = nextRecreateOrdinal(ops, runId, finding.label);
+      ordinal = nextCreateOrdinal(ops, runId, finding.label);
     }
     const label = ordinal === 1 ? finding.label : `${finding.label}/r${ordinal}`;
     const marker = findingMarker(runId, label);

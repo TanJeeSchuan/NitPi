@@ -66,6 +66,14 @@ export function recordMatchesRemote(
  * list. */
 export type PaginatedRead<T> = { ok: true; items: T[] } | { ok: false; status: number };
 
+/** Follow the listing's `Link` header (`rel="next"`, GitHub's pagination
+ * contract) page by page; without one, a shorter-than-`per_page` page ends
+ * the listing. */
+function hasNext(response: { status: number; headers?: Record<string, string> }): boolean {
+  const link = response.headers?.["link"] ?? "";
+  return /rel="next"/.test(link);
+}
+
 /** Read all of the pull request's review comments, any author, following
  * pagination (`page`/`per_page`) until the listing is exhausted. */
 export async function readAllReviewComments(
@@ -87,7 +95,7 @@ export async function readAllReviewComments(
         ...(raw.in_reply_to_id != null ? { inReplyToId: raw.in_reply_to_id as number } : {}),
       });
     }
-    if ((response.body as Array<unknown>).length < perPage) return { ok: true, items };
+    if (!hasNext(response)) return { ok: true, items };
   }
 }
 
@@ -111,7 +119,7 @@ export async function readAllReviews(
         commitId: (raw.commit_id as string) ?? "",
       });
     }
-    if ((response.body as Array<unknown>).length < perPage) return { ok: true, items };
+    if (!hasNext(response)) return { ok: true, items };
   }
 }
 

@@ -129,11 +129,15 @@ export function recreateOperationKey(runId: string, label: string, recreateOrdin
   return operationKey("create-comment", runId, `${label}/r${recreateOrdinal}`);
 }
 
-/** Ordinal for the next recreate of one run's finding, from the ledger's
- * existing ops (pure; no counter state). */
-export function nextRecreateOrdinal(ops: PublicationOp[], runId: string, label: string): number {
-  const prefix = operationKey("create-comment", runId, `${label}/r`);
-  return ops.filter((op) => op.opKey.startsWith(prefix)).length + 1;
+/** Ordinal for the next create-comment write of one run's finding, from
+ * the ledger's existing ops (pure; no counter state). The first write is
+ * ordinal 1 (plain key); replacements and recreates append `/r<N>` so every
+ * published comment has a unique operation key and marker. */
+export function nextCreateOrdinal(ops: PublicationOp[], runId: string, label: string): number {
+  const base = operationKey("create-comment", runId, label);
+  const recreatePrefix = `${base}/r`;
+  const count = ops.filter((op) => op.opKey === base || op.opKey.startsWith(recreatePrefix)).length;
+  return count + 1;
 }
 
 // --- ledger ------------------------------------------------------------------

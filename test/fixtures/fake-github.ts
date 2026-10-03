@@ -269,14 +269,11 @@ export class FakeGitHub {
     }
 
     if (method === "GET" && prMatch) {
-      this.respond(
-        response,
-        200,
-        this.listPage(
-          this.state.reviews.filter((r) => r.pullNumber === Number(prMatch[1])).map((r) => this.toRestReview(r)),
-          params,
-        ),
+      const page = this.listPage(
+        this.state.reviews.filter((r) => r.pullNumber === Number(prMatch[1])).map((r) => this.toRestReview(r)),
+        params,
       );
+      this.respondPaged(response, 200, page.items, page.nextUrl);
       return;
     }
 
@@ -329,14 +326,11 @@ export class FakeGitHub {
         this.respond(response, 404, { message: "Not Found" });
         return;
       }
-      this.respond(
-        response,
-        200,
-        this.listPage(
-          this.state.comments.filter((c) => c.pullNumber === pullNumber).map((c) => this.toRestComment(c)),
-          params,
-        ),
+      const page = this.listPage(
+        this.state.comments.filter((c) => c.pullNumber === pullNumber).map((c) => this.toRestComment(c)),
+        params,
       );
+      this.respondPaged(response, 200, page.items, page.nextUrl);
       return;
     }
 
@@ -428,14 +422,28 @@ export class FakeGitHub {
   }
 
   /** Honor `page`/`per_page` like the REST list endpoints; a forced page
-   * size (the pagination exercise) caps every page. */
-  private listPage<T>(items: T[], params: URLSearchParams): T[] {
+   * size (the pagination exercise) caps every page. Emits the `Link` header
+   * with `rel="next"` while more pages remain. */
+  private listPage<T>(items: T[], params: URLSearchParams): { items: T[]; nextUrl?: string } {
     const requested = Number.parseInt(params.get("per_page") ?? "", 10);
     const perPage =
       this.state.enforceListPageSize ??
       (Number.isInteger(requested) && requested > 0 ? requested : items.length + 1);
     const page = Math.max(1, Number.parseInt(params.get("page") ?? "1", 10) || 1);
-    return items.slice((page - 1) * perPage, page * perPage);
+    const slice = items.slice((page - 1) * perPage, page * perPage);
+    if (page * perPage < items.length) {
+      return { items: slice, nextUrl: `?page=${page + 1}&per_page=${perPage}` };
+    }
+    return { items: slice };
+  }
+
+  /** respond() plus the paged Link header (relative URL, like GitHub). */
+  private respondPaged(response: ServerResponse, status: number, body: unknown, nextUrl?: string): void {
+    if (nextUrl) {
+      this.respond(response, status, body, { link: `<${nextUrl}>; rel="next"` });
+      return;
+    }
+    this.respond(response, status, body);
   }
 
   /** Range-aware anchor check (ticket 02): the end anchor must be in the
