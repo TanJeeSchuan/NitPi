@@ -33,6 +33,7 @@
  * retried here. Publication idempotency and reconciliation are ticket 05.
  */
 import type { InlineLocation, ReviewFinding, DiffSide } from "../review-host/artifact.js";
+import type { Context } from "@earendil-works/chord";
 import type { RunDocument } from "../review-host/run-history.js";
 import {
   isSupersededComment,
@@ -43,6 +44,80 @@ import {
   type PublishedComment,
   type ValidMatch,
 } from "../review-host/matching.js";
+import {
+  PublicationLedger,
+  bodyWithMarker,
+  extractMarkers,
+  nextRecreateOrdinal,
+  operationKey,
+  findingMarker,
+  recreateOperationKey,
+  summaryMarker,
+  type PublicationIntent,
+  type PublicationOp,
+  type PublicationRemote,
+} from "./ledger.js";
+import { isRateLimited, rateLimitDelayMs, retryAfterMs } from "./retry.js";
+import {
+  readAllReviewComments,
+  readAllReviews,
+  readThreadPages,
+  recordMatchesRemote,
+  type ReconcileComment,
+  type ReconcileReview,
+} from "./publication-reads.js";
+
+/** Error thrown when a write's outcome could not be determined either way
+ * (GitHub may have accepted it; the response never arrived). Reconciliation —
+ * not a blind create retry — decides what happened. */
+export class WriteOutcomeUnknown extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WriteOutcomeUnknown";
+  }
+}
+
+/** Ledger the publisher records every intended write into before sending. */
+export type PublishLedgerHooks = {
+  ledger: PublicationLedger;
+  runId: string;
+  /** The reviewed subject every operation belongs to. */
+  subject: RunDocument["subject"];
+  /** Injectable pacing for rate-limit waits (tests pass clock-advancing). */
+  sleep: (ms: number) => Promise<void>;
+  context: Context;
+};
+
+/** The result of reconciling one write against GitHub's actual state. */
+export type ReconcileResult =
+  | { status: "confirmed"; remote: PublicationRemote }
+  | { status: "not_found" }
+  | { status: "retry" }
+  | { status: "unknown"; detail?: string };
+
+/** Bounded reconciliation rounds after a lost response. */
+const MAX_LOST_RESPONSE_ROUNDS = 3;
+/** Bounded paced retries for one rate-limited write (exponential waits). */
+const MAX_RATE_LIMIT_RESPONSES = 4;
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** A body rewritten with every given marker comment appended (missing ones
+ * only): updated bodies keep every earlier marker so each run's unconfirmed
+ * operation can still find its object after a later run's update. */
+function bodyWithMarkers(body: string, markers: readonly string[]): string {
+  let result = body;
+  for (const marker of markers) result = bodyWithMarker(result, marker);
+  return result;
+}
+
+/** The publisher's superseded banner as reconciliation sees it (the first
+ * line must still be the banner for `isSupersededComment`'s startsWith). */
+function isSupersededCommentText(body: string): boolean {
+  return body.startsWith(SUPERSEDED_MARKER_PREFIX);
+}
 
 /** Typed subset of the GitHub REST + GraphQL endpoints the reviewer host uses. */
 export interface GitHubApi {
@@ -194,7 +269,10 @@ interface ThreadInfo {
 }
 
 export class Publisher {
-  constructor(readonly api: GitHubApi) {}
+  constructor(
+    readonly api: GitHubApi,
+    private readonly ledgerHooks?: PublishLedgerHooks,
+  ) {}
 
   async checkInProgress(subject: RunDocument["subject"], stage: string): Promise<void> {
     await this.createCheck(subject, {
@@ -235,61 +313,36 @@ export class Publisher {
     }));
   }
 
-  /** The bot's newest summary review on the pull request, if any. When it
-   * exists, a rerun PATCHes it instead of adding another summary. */
+  /** The bot's summary review for THIS run: the review whose body carries
+   * this run's summary marker. Falls back to the bot's newest review when no
+   * marker is present (runs published before ticket 05). When it exists, a
+   * rerun PATCHes it instead of adding another summary. */
   private async botSummaryReview(
     subject: RunDocument["subject"],
     botLogin: string,
-  ): Promise<{ id: number } | undefined> {
+    runId: string,
+  ): Promise<{ id: number; body: string } | undefined> {
     const response = await this.api.listReviews(subject.repository, subject.pullNumber);
     this.ensureStatus(response, 200, "listing reviews");
     const body = response.body as Array<Record<string, unknown>>;
-    let newest: { id: number } | undefined;
+    const marker = summaryMarker(runId);
+    let newest: { id: number; body: string } | undefined;
     for (const raw of body) {
       const id = raw.id as number;
       if (authorLogin(raw) !== botLogin || typeof id !== "number") continue;
-      if (!newest || id > newest.id) newest = { id };
+      const candidate = { id, body: (raw.body as string) ?? "" };
+      if (extractMarkers(candidate.body).includes(marker)) return candidate;
+      if (!newest || id > newest.id) newest = candidate;
     }
     return newest;
   }
 
   /** GraphQL thread state keyed by the database ID of any comment in the
-   * thread. First page of 100 covers v0; pagination is ticket 05's domain. */
+   * thread, read with pagination (ticket 05: list and paginate). */
   private async loadThreadMap(subject: RunDocument["subject"]): Promise<Map<number, ThreadInfo>> {
-    const [owner, name] = subject.repository.split("/");
-    const query = `query($owner: String!, $name: String!, $number: Int!) {
-  repository(owner: $owner, name: $name) {
-    pullRequest(number: $number) {
-      reviewThreads(first: 100) {
-        nodes {
-          id
-          isResolved
-          comments(first: 20) { nodes { databaseId } }
-        }
-      }
-    }
-  }
-}`;
-    const response = await this.api.graphql(query, { owner, name, number: subject.pullNumber });
-    this.ensureGraphqlOk(response, "review-threads query");
-    const data = response.body.data as
-      | {
-          repository?: {
-            pullRequest?: {
-              reviewThreads?: {
-                nodes?: Array<{
-                  id: string;
-                  isResolved: boolean;
-                  comments: { nodes: Array<{ databaseId: number }> };
-                }>;
-              };
-            };
-          };
-        }
-      | undefined;
-    const nodes = data?.repository?.pullRequest?.reviewThreads?.nodes ?? [];
+    const threads = await readThreadPages(this.api, subject.repository, subject.pullNumber);
     const map = new Map<number, ThreadInfo>();
-    for (const thread of nodes) {
+    for (const thread of threads) {
       for (const comment of thread.comments.nodes) {
         map.set(comment.databaseId, { threadId: thread.id, isResolved: thread.isResolved });
       }
@@ -301,6 +354,7 @@ export class Publisher {
     subject: RunDocument["subject"],
     threadId: string,
     resolved: boolean,
+    runId: string,
   ): Promise<void> {
     const mutation = resolved
       ? `mutation($input: ResolveReviewThreadInput!) {
@@ -309,11 +363,30 @@ export class Publisher {
       : `mutation($input: UnresolveReviewThreadInput!) {
   unresolveReviewThread(input: $input) { thread { id isResolved } }
 }`;
-    const response = await this.api.graphql(mutation, { input: { threadId } });
-    this.ensureGraphqlOk(
-      response,
-      resolved ? "resolveReviewThread" : "unresolveReviewThread",
-    );
+    await this.runLedgered({
+      intent: resolved ? "resolve-thread" : "unresolve-thread",
+      subjectKey: `thread-${threadId}`,
+      // GraphQL mutations carry no body to mark; the record's payload
+      // (threadId + intended state) is the reconciliation input.
+      marker: "",
+      payload: { threadId, resolved },
+      runId,
+      send: () => this.api.graphql(mutation, { input: { threadId } }),
+      ok: (response) => {
+        const errors = response.body.errors;
+        if (response.status !== 200 || errors?.length) {
+          return { ok: false, reason: `${resolved ? "resolveReviewThread" : "unresolveReviewThread"} failed: ${errors?.[0]?.message ?? `HTTP ${response.status}`}` };
+        }
+        return { ok: true, remote: {} };
+      },
+      reconcile: async () => {
+        const threads = await readThreadPages(this.api, subject.repository, subject.pullNumber);
+        const thread = threads.find((t) => t.id === threadId);
+        if (!thread) return { status: "not_found" as const };
+        if (thread.isResolved === resolved) return { status: "confirmed" as const, remote: {} };
+        return { status: "retry" as const };
+      },
+    });
   }
 
   /**
@@ -321,7 +394,17 @@ export class Publisher {
    * request's threads in sync with this run's final review. `earlier` is the
    * review-comment snapshot the matching turn saw; `rawMatches` are the
    * model's assignments, validated here before anything is acted on.
-   * Failure = explicit reason; nothing is retried here (ticket 05).
+   *
+   * Ticket 05: every write is durable-idiempotent. Before each GitHub write
+   * the publisher commits an operation key (logical finding, reviewed
+   * subject, intended change) and the payload; the remote ID is recorded
+   * once GitHub confirms. A response that never arrives is reconciled
+   * against GitHub's actual state — the object adopted when it landed, the
+   * write retried when the listing proves it did not, and
+   * `WriteOutcomeUnknown` raised when neither can be established. 403/429
+   * responses wait out `Retry-After` (at least one minute without it),
+   * backing off exponentially; auth, permission and anchor errors fail once
+   * with a reason.
    */
   async publish(
     run: RunDocument,
@@ -334,9 +417,18 @@ export class Publisher {
     const botLogin = await this.botLogin();
     const { matches: validMatches, rejections } = validateMatches(rawMatches, earlier, botLogin);
     const subject = run.subject;
+    const runId = run.runId;
 
-    // One maintained summary: update the bot's newest review when one exists.
-    const summaryReview = await this.botSummaryReview(subject, botLogin);
+    // Fresh live state for write decisions (ticket 05): a comment the
+    // matching snapshot knew that GitHub no longer has was deleted by hand —
+    // reconciled against this listing before anything is recreated.
+    const liveComments = earlier.length > 0 ? await this.listPublishedComments(subject) : earlier;
+    const liveById = new Map(liveComments.map((c) => [c.id, c]));
+
+    // One maintained summary: update the bot's review for this run when it
+    // exists (marker match, ticket 05), else the newest bot review (runs
+    // published before markers did).
+    const summaryReview = await this.botSummaryReview(subject, botLogin, runId);
 
     // Sync mode when the run must not blanket-post findings inline: a bot
     // summary already exists, or earlier bot comments exist to match against
@@ -345,14 +437,32 @@ export class Publisher {
     let reviewId: number;
     let inlineIds: number[] = [];
     if (summaryReview) {
-      const patched = await this.api.updateReview(
-        subject.repository,
-        subject.pullNumber,
-        summaryReview.id,
-        { body: renderSummary(run, finalReview, findings.length) },
-      );
-      this.ensureStatus(patched, 200, `updating the summary review ${summaryReview.id}`);
+      const summaryBody = this.ledgerHooks
+        ? bodyWithMarker(renderSummary(run, finalReview, findings.length), summaryMarker(runId))
+        : renderSummary(run, finalReview, findings.length);
       reviewId = summaryReview.id;
+      await this.runLedgered({
+        intent: "update-review",
+        subjectKey: "summary",
+        marker: summaryMarker(runId),
+        payload: { body: summaryBody },
+        runId,
+        send: () =>
+          this.api.updateReview(subject.repository, subject.pullNumber, summaryReview.id, { body: summaryBody }),
+        ok: (response) =>
+          response.status === 200
+            ? { ok: true, remote: { reviewId: summaryReview.id } }
+            : { ok: false, reason: `updating the summary review ${summaryReview.id} failed with HTTP ${response.status}: ${describeBody(response.body)}` },
+        reconcile: async () => {
+          const reviews = await readAllReviews(this.api, subject.repository, subject.pullNumber);
+          if (reviews.length === 0) return { status: "unknown" as const, detail: "listing reviews failed" };
+          const found = reviews.find(
+            (r) => r.id === summaryReview.id && extractMarkers(r.body).includes(summaryMarker(runId)),
+          );
+          if (found) return { status: "confirmed" as const, remote: { reviewId: found.id } };
+          return { status: "not_found" as const };
+        },
+      });
     } else {
       // The summary carries the true finding count even in sync mode, where
       // the findings themselves land as standalone comments via the loop.
@@ -374,34 +484,76 @@ export class Publisher {
     if (sync) {
       for (const finding of findings) {
         const matchedId = matchByLabel.get(finding.label);
-        if (matchedId === undefined) {
-          commentIds.push(await this.postComment(subject, finding, signal));
+        if (matchedId === undefined || !liveById.has(matchedId)) {
+          // No match, or the matched comment was deleted by hand between the
+          // matching snapshot and this write: the fresh listing above is the
+          // reconciliation — it is only recreated now that GitHub's actual
+          // state shows it absent (ticket 05).
+          commentIds.push(await this.postComment(subject, finding, runId, signal));
           continue;
         }
-        const earlierComment = earlier.find((c) => c.id === matchedId)!;
-        if (sameAnchor(earlierComment, finding)) {
+        const live = liveById.get(matchedId)!;
+        if (sameAnchor(live, finding)) {
           // Recurring after resolution: reopen the thread, then update.
           const thread = threads?.get(matchedId);
-          if (thread?.isResolved) await this.setThreadResolved(subject, thread.threadId, false);
-          const patched = await this.api.updateReviewComment(
-            subject.repository,
-            matchedId,
-            { body: finding.section },
-            signal,
-          );
-          this.ensureStatus(patched, 200, `updating comment ${matchedId}`);
+          if (thread?.isResolved) {
+            await this.setThreadResolved(subject, thread.threadId, false, runId);
+          }
+          const body = this.ledgerHooks
+            ? bodyWithMarkers(finding.section, [
+                ...extractMarkers(live.body),
+                findingMarker(runId, finding.label),
+              ])
+            : finding.section;
+          await this.runLedgered({
+            intent: "update-comment",
+            subjectKey: finding.label,
+            marker: findingMarker(runId, finding.label),
+            payload: { commentId: matchedId, body },
+            runId,
+            send: () =>
+              this.api.updateReviewComment(subject.repository, matchedId, { body }, signal),
+            ok: (response) =>
+              response.status === 200
+                ? { ok: true, remote: { commentId: matchedId } }
+                : { ok: false, status: response.status, reason: `updating comment ${matchedId} failed with HTTP ${response.status}: ${describeBody(response.body)}` },
+            reconcile: async () => {
+              const comments = await readAllReviewComments(this.api, subject.repository, subject.pullNumber);
+              if (comments.length === 0) return { status: "unknown" as const, detail: "listing review comments failed" };
+              const found = comments.find(
+                (c) => c.id === matchedId && extractMarkers(c.body).includes(findingMarker(runId, finding.label)),
+              );
+              if (found) return { status: "confirmed" as const, remote: { commentId: found.id } };
+              return { status: "not_found" as const };
+            },
+          });
           commentIds.push(matchedId);
         } else {
           // Moved: mark the old comment superseded and post a replacement at
-          // the new anchor, keeping the old discussion.
-          const superseded = await this.api.updateReviewComment(
-            subject.repository,
-            matchedId,
-            { body: supersededBody(earlierComment.body, finding) },
-            signal,
-          );
-          this.ensureStatus(superseded, 200, `marking comment ${matchedId} superseded`);
-          commentIds.push(await this.postComment(subject, finding, signal));
+          // the new anchor, keeping the old discussion. The replacement gets
+          // its own ordinal marker: the old comment keeps the original's.
+          const supersededBodyText = supersededBody(live.body, finding);
+          await this.runLedgered({
+            intent: "supersede-comment",
+            subjectKey: finding.label,
+            marker: findingMarker(runId, finding.label),
+            payload: { commentId: matchedId, body: supersededBodyText },
+            runId,
+            send: () =>
+              this.api.updateReviewComment(subject.repository, matchedId, { body: supersededBodyText }, signal),
+            ok: (response) =>
+              response.status === 200
+                ? { ok: true, remote: { commentId: matchedId } }
+                : { ok: false, status: response.status, reason: `marking comment ${matchedId} superseded failed with HTTP ${response.status}: ${describeBody(response.body)}` },
+            reconcile: async () => {
+              const comments = await readAllReviewComments(this.api, subject.repository, subject.pullNumber);
+              if (comments.length === 0) return { status: "unknown" as const, detail: "listing review comments failed" };
+              const found = comments.find((c) => c.id === matchedId && isSupersededCommentText(c.body));
+              if (found) return { status: "confirmed" as const, remote: { commentId: found.id } };
+              return { status: "not_found" as const };
+            },
+          });
+          commentIds.push(await this.postComment(subject, finding, runId, signal));
         }
       }
     }
@@ -417,15 +569,19 @@ export class Publisher {
         if (comment.author !== botLogin || claimed.has(comment.id)) continue;
         const thread = threads.get(comment.id);
         if (!thread || thread.isResolved) continue;
-        await this.setThreadResolved(subject, thread.threadId, true);
+        await this.setThreadResolved(subject, thread.threadId, true, runId);
       }
     }
 
     return { reviewId, commentIds, rejections };
   }
 
-  /** First publication: one review with the summary and (unless the run is
-   * syncing against earlier threads) one inline comment per finding. */
+  /**
+   * First publication: one review with the summary and (unless the run is
+   * syncing against earlier threads) one inline comment per finding. The
+   * whole write is one ledgered operation: the summary marker identifies the
+   * review, each inline body carries its finding's marker.
+   */
   private async createReviewWithFindings(
     run: RunDocument,
     finalReview: string,
@@ -433,69 +589,233 @@ export class Publisher {
     inline: ReviewFinding[],
     signal?: AbortSignal,
   ): Promise<{ reviewId: number; commentIds: number[] }> {
-    const response = await this.api.createReview(
-      run.subject.repository,
-      run.subject.pullNumber,
-      {
-        commit_id: run.subject.headSha,
-        event: "COMMENT",
-        body: renderSummary(run, finalReview, findingCount),
-        comments: inline.map((f) => ({
-          path: f.path,
-          side: f.side,
-          line: f.line,
-          ...(f.startSide !== undefined && f.startLine !== undefined
-            ? { start_side: f.startSide, start_line: f.startLine }
-            : {}),
-          body: f.section,
-        })),
-      },
-      signal,
-    );
-    if (response.status === 422) {
-      throw new PublishError(`GitHub rejected the review: ${describeBody(response.body)}`);
-    }
-    this.ensureStatus(response, 201, "GitHub create review");
-    const created = response.body as { id?: number; comments?: Array<{ id: number }> };
-    if (typeof created.id !== "number") {
-      throw new PublishError("GitHub create review returned no review id");
-    }
-    return {
-      reviewId: created.id,
-      commentIds: (created.comments ?? []).map((c) => c.id),
+    const body = this.ledgerHooks
+      ? bodyWithMarker(renderSummary(run, finalReview, findingCount), summaryMarker(run.runId))
+      : renderSummary(run, finalReview, findingCount);
+    const payload = {
+      commit_id: run.subject.headSha,
+      event: "COMMENT" as const,
+      body,
+      comments: inline.map((f) => ({
+        path: f.path,
+        side: f.side,
+        line: f.line,
+        ...(f.startSide !== undefined && f.startLine !== undefined
+          ? { start_side: f.startSide, start_line: f.startLine }
+          : {}),
+        body: this.ledgerHooks ? bodyWithMarker(f.section, findingMarker(run.runId, f.label)) : f.section,
+      })),
     };
+    const remote = await this.runLedgered({
+      intent: "create-review",
+      subjectKey: "summary",
+      marker: summaryMarker(run.runId),
+      payload,
+      runId: run.runId,
+      send: () => this.api.createReview(run.subject.repository, run.subject.pullNumber, payload, signal),
+      ok: (response) => {
+        if (response.status === 422) {
+          return { ok: false, status: 422, reason: `GitHub rejected the review: ${describeBody(response.body)}` };
+        }
+        const created = response.body as { id?: number; comments?: Array<{ id: number }> };
+        if (response.status !== 201) {
+          return { ok: false, status: response.status, reason: `GitHub create review failed with HTTP ${response.status}: ${describeBody(response.body)}` };
+        }
+        if (typeof created.id !== "number") {
+          return { ok: false, reason: "GitHub create review returned no review id" };
+        }
+        return {
+          ok: true,
+          remote: { reviewId: created.id, commentIds: (created.comments ?? []).map((c) => c.id) },
+        };
+      },
+      reconcile: async () => {
+        const reviews = await readAllReviews(this.api, run.subject.repository, run.subject.pullNumber);
+        if (reviews.length === 0) return { status: "unknown" as const, detail: "listing reviews failed" };
+        const found = reviews.find(
+          (r) => extractMarkers(r.body).includes(summaryMarker(run.runId)) && r.commitId === run.subject.headSha,
+        );
+        if (found) {
+          const full = found as ReconcileReview & { comments?: Array<{ id: number }> };
+          return {
+            status: "confirmed" as const,
+            remote: { reviewId: found.id, commentIds: (full.comments ?? []).map((c) => c.id) },
+          };
+        }
+        return { status: "not_found" as const };
+      },
+    });
+    return { reviewId: remote.reviewId!, commentIds: remote.commentIds ?? [] };
   }
 
-  /** Post one finding as a standalone review comment at its anchor. */
+  /** Post one finding as a standalone review comment at its anchor,
+   * carrying the finding's current-ordinal marker. */
   private async postComment(
     subject: RunDocument["subject"],
     finding: ReviewFinding,
+    runId: string,
     signal?: AbortSignal,
   ): Promise<number> {
-    const response = await this.api.createReviewComment(
-      subject.repository,
-      subject.pullNumber,
-      {
-        commit_id: subject.headSha,
-        path: finding.path,
-        side: finding.side,
-        line: finding.line,
-        ...(finding.startSide !== undefined && finding.startLine !== undefined
-          ? { start_side: finding.startSide, start_line: finding.startLine }
-          : {}),
-        body: finding.section,
+    // Ordinal marker: the first comment for this label in this run is plain;
+    // a replacement (moved finding) or a recreate after a manual deletion
+    // appends an ordinal so each published comment is uniquely findable.
+    let ordinal = 1;
+    const hooks = this.ledgerHooks;
+    if (hooks) {
+      const ops = await hooks.ledger.opsForRun(runId, hooks.context);
+      ordinal = nextRecreateOrdinal(ops, runId, finding.label);
+    }
+    const label = ordinal === 1 ? finding.label : `${finding.label}/r${ordinal}`;
+    const marker = findingMarker(runId, label);
+    const payload = {
+      commit_id: subject.headSha,
+      path: finding.path,
+      side: finding.side,
+      line: finding.line,
+      ...(finding.startSide !== undefined && finding.startLine !== undefined
+        ? { start_side: finding.startSide, start_line: finding.startLine }
+        : {}),
+      body: this.ledgerHooks ? bodyWithMarker(finding.section, marker) : finding.section,
+    };
+    const remote = await this.runLedgered({
+      intent: "create-comment",
+      subjectKey: label,
+      marker,
+      payload,
+      runId,
+      send: () => this.api.createReviewComment(subject.repository, subject.pullNumber, payload, signal),
+      ok: (response) => {
+        if (response.status === 422) {
+          return { ok: false, status: 422, reason: `GitHub rejected the comment anchor: ${describeBody(response.body)}` };
+        }
+        const created = response.body as { id?: number };
+        if (response.status !== 201) {
+          return { ok: false, status: response.status, reason: `GitHub create comment failed with HTTP ${response.status}: ${describeBody(response.body)}` };
+        }
+        if (typeof created.id !== "number") {
+          return { ok: false, reason: "GitHub create comment returned no comment id" };
+        }
+        return { ok: true, remote: { commentId: created.id } };
       },
-      signal,
-    );
-    if (response.status === 422) {
-      throw new PublishError(`GitHub rejected the comment anchor: ${describeBody(response.body)}`);
+      reconcile: async () => {
+        const comments = await readAllReviewComments(this.api, subject.repository, subject.pullNumber);
+        if (comments.length === 0) return { status: "unknown" as const, detail: "listing review comments failed" };
+        const found = comments.find(
+          (c) => extractMarkers(c.body).includes(marker) && c.commitId === subject.headSha,
+        );
+        if (found) return { status: "confirmed" as const, remote: { commentId: found.id } };
+        return { status: "not_found" as const };
+      },
+    });
+    return remote.commentId!;
+  }
+
+  /**
+   * One paced, ledgered GitHub write (ticket 05). Before the send, the
+   * intent — operation key, payload, marker, attempt ordinal — commits
+   * durably; after GitHub confirms, the remote IDs are recorded. A response
+   * that never arrives is reconciled against GitHub's actual state: the
+   * object is adopted when it landed, the write retried when the listing
+   * proves it did not, and `WriteOutcomeUnknown` raised when neither can be
+   * established. 403/429 responses pace with `Retry-After` (at least one
+   * minute without it), backing off exponentially, bounded; auth,
+   * permission and anchor errors fail once with a reason.
+   */
+  private async runLedgered<T>(input: {
+    intent: PublicationIntent;
+    subjectKey: string;
+    marker: string;
+    payload: unknown;
+    runId: string;
+    send: () => Promise<T>;
+    ok: (response: T) => { ok: true; remote: PublicationRemote } | { ok: false; status?: number; reason: string };
+    reconcile: () => Promise<ReconcileResult>;
+  }): Promise<PublicationRemote> {
+    const hooks = this.ledgerHooks;
+    let attempts = 0;
+    let rateLimitStreak = 0;
+    let lostRounds = 0;
+    for (;;) {
+      attempts += 1;
+      if (hooks) {
+        await hooks.ledger.recordIntent(
+          {
+            opKey: operationKey(input.intent, input.runId, input.subjectKey),
+            runId: input.runId,
+            intent: input.intent,
+            subject: input.subjectKey,
+            reviewedSubject: {
+              repository: hooks.subject.repository,
+              pullNumber: hooks.subject.pullNumber,
+              headSha: hooks.subject.headSha,
+            },
+            payload: input.payload,
+            marker: input.marker,
+            attempts,
+          },
+          hooks.context,
+        );
+      }
+      let response: T;
+      try {
+        response = await input.send();
+      } catch {
+        // The response never arrived: GitHub may have accepted the write.
+        // Without a ledger the body carries no marker to reconcile against,
+        // so the outcome cannot be established either way.
+        if (!hooks) {
+          throw new WriteOutcomeUnknown(
+            `publication write ${input.intent}/${input.subjectKey} lost its response; outcome stays unknown`,
+          );
+        }
+        lostRounds += 1;
+        if (lostRounds > MAX_LOST_RESPONSE_ROUNDS) {
+          throw new WriteOutcomeUnknown(
+            `publication write ${input.intent}/${input.subjectKey} could not be reconciled: its outcome stays unknown`,
+          );
+        }
+        const outcome = await input.reconcile();
+        if (outcome.status === "confirmed") {
+          if (hooks) {
+            await hooks.ledger.confirmFromState(
+              operationKey(input.intent, input.runId, input.subjectKey),
+              outcome.remote,
+              hooks.context,
+            );
+          }
+          return outcome.remote;
+        }
+        if (outcome.status === "not_found" || outcome.status === "retry") continue; // Proven absent (or re-derivable): re-issue under the same key.
+        throw new WriteOutcomeUnknown(
+          `publication write ${input.intent}/${input.subjectKey} could not be reconciled: ${outcome.status === "unknown" ? outcome.detail ?? "GitHub state unreadable" : "unreadable"}`,
+        );
+      }
+      const verdict = input.ok(response);
+      if (verdict.ok) {
+        if (hooks) {
+          await hooks.ledger.confirm(
+            operationKey(input.intent, input.runId, input.subjectKey),
+            verdict.remote,
+            hooks.context,
+          );
+        }
+        return verdict.remote;
+      }
+      const status = verdict.status;
+      if (status !== undefined && isRateLimited(status)) {
+        rateLimitStreak += 1;
+        if (rateLimitStreak > MAX_RATE_LIMIT_RESPONSES) {
+          throw new PublishError(verdict.reason);
+        }
+        const headers = (response as unknown as { headers?: Record<string, string> }).headers;
+        const delayMs = rateLimitDelayMs(status, rateLimitStreak, headers);
+        await (hooks ? hooks.sleep(delayMs) : sleepMs(delayMs));
+        continue; // Re-issue under the same key after the documented wait.
+      }
+      // Auth, permission, anchor and other GitHub rejections: fail once with
+      // a reason. Nothing is retried here.
+      throw new PublishError(verdict.reason);
     }
-    this.ensureStatus(response, 201, "GitHub create comment");
-    const created = response.body as { id?: number };
-    if (typeof created.id !== "number") {
-      throw new PublishError("GitHub create comment returned no comment id");
-    }
-    return created.id;
   }
 
   async checkSuccess(subject: RunDocument["subject"], findingCount: number): Promise<void> {

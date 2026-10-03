@@ -32,20 +32,20 @@ export function retryAfterMs(storedHeaders: Record<string, string> | undefined |
 }
 
 /**
- * Wait for one rate-limit response: `Retry-After` when present, else the
- * one-minute minimum, and each successive response of a run doubles its
- * predecessor (exponential back-off).
+ * Wait for one rate-limit response: `Retry-After` when present (followed
+ * exactly), else the one-minute minimum growing exponentially with the
+ * streak of rate-limit responses within this run (60s, 2min, 4min…).
  */
-export async function rateLimitDelayMs(
+export function rateLimitDelayMs(
   status: number,
   rateLimitStreak: number,
-  getHeaders: () => Record<string, string>,
-): Promise<number> {
+  storedHeaders: Record<string, string> | undefined | null,
+): number {
   if (!isRateLimited(status)) return 0;
-  const retryAfter = retryAfterMs(getHeaders());
-  const exponential = Math.min(
+  const retryAfter = retryAfterMs(storedHeaders);
+  if (retryAfter !== undefined) return retryAfter;
+  return Math.min(
     RATE_LIMIT_MAX_WAIT_MS,
     RATE_LIMIT_MIN_WAIT_MS * 2 ** Math.max(0, rateLimitStreak - 1),
   );
-  return Math.max(exponential, retryAfter ?? 0);
 }
