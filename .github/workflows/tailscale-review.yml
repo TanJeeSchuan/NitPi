@@ -1,0 +1,253 @@
+# The reviewer runs for real on one of my repositories (ticket 11).
+#
+# Trusted main-branch workflow: receives comment and pull-request events,
+# joins the runner to my tailnet as an ephemeral tagged node, and runs the
+# review host (actions/entry.mts) against the homeserver storage service.
+# Its settings are workflow inputs and its credentials are GitHub secrets.
+#
+# A PR cannot change the workflow that gates it: `issue_comment` and
+# `pull_request_target` runs always use the default branch's copy of this
+# file, the checkout below is pinned to `github.event.repository.default_branch`,
+# and the reviewed head is fetched only as git objects (its code is never
+# executed by the workflow — the reviewers browse it as evidence, and fork
+# heads additionally need a writer's per-commit approval inside the gate).
+#
+# The checks in this file sit outside the scenario test seam; manual
+# verification on a real PR is the acceptance gate. docs/actions-setup.md
+# lists the manual checklist and mirrors the steps below for humans.
+
+name: nitpi-reviewer
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+      - closed
+      - converted_to_draft
+  # Named-check clock (automatic mode): the host's drain loop serves a
+  # pending request for a bounded window and then exits, keeping the request
+  # durable; a completed check-run delivery re-invokes the entry to serve it.
+  check_run:
+    types: [completed]
+
+# One review pipeline per pull request, cancel-in-progress disabled: a new
+# commit does not cancel the active run (the durable gate coalesces), and
+# re-running the failed job reopens the same attempt (ticket 06).
+concurrency:
+  group: nitpi-review-${{ github.event.issue.number || github.event.pull_request.number || github.event.check_run.pull_requests[0].number || github.run_id }}
+  cancel-in-progress: false
+
+# The default token reads the default-branch checkout only. Review
+# publication and check runs run under the NITPI_GITHUB_TOKEN secret (a
+# token with pull-requests: write and checks: write), so the job's own
+# token stays read-only even though `pull_request_target` would grant it
+# write scopes.
+permissions:
+  contents: read
+
+env:
+  # ── Workflow inputs (the trusted main-branch settings; no extra config
+  #    file). Leave blank to fail fast with a configuration error.
+  NITPI_INPUT_MODE: manual
+  NITPI_INPUT_AUTOMATIC_PRESET: "false"
+  NITPI_INPUT_EVENT_OPENED: "true"
+  NITPI_INPUT_EVENT_REOPENED: "true"
+  NITPI_INPUT_EVENT_SYNCHRONIZE: "true"
+  NITPI_INPUT_EVENT_READY_FOR_REVIEW: "true"
+  NITPI_INPUT_WAIT_FOR_CHECKS: ""
+  NITPI_INPUT_REFUSAL_CHECK_BEHAVIOR: as-refused
+  NITPI_INPUT_PRIMARY_BASE_URL: ""
+  NITPI_INPUT_PRIMARY_MODEL_ID: ""
+  NITPI_INPUT_PRIMARY_PROVIDER_OPTIONS: ""
+  NITPI_INPUT_PRIMARY_CUSTOM_PROMPT: ""
+  NITPI_INPUT_PRIMARY_CUSTOM_PROMPT_MODE: ""
+  NITPI_INPUT_PRIMARY_DEADLINE_MS: "900000"
+  NITPI_INPUT_RE_REVIEW_BASE_URL: ""
+  NITPI_INPUT_RE_REVIEW_MODEL_ID: ""
+  NITPI_INPUT_RE_REVIEW_PROVIDER_OPTIONS: ""
+  NITPI_INPUT_RE_REVIEW_CUSTOM_PROMPT: ""
+  NITPI_INPUT_RE_REVIEW_CUSTOM_PROMPT_MODE: ""
+  NITPI_INPUT_RE_REVIEW_DEADLINE_MS: "900000"
+  NITPI_INPUT_STORAGE_BASE_URL: ""
+  NITPI_TAILSCALE_TAG: tag:ci-nitpi-reviewer
+
+jobs:
+  # ─── Route the delivered event ────────────────────────────────────────────
+  # Payload normalization only: which entry invocation, which command, which
+  # PR. No gate decisions, no checkout, no secrets.
+  decide:
+    name: route the delivery
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - id: route
+        env:
+          NITPI_INPUT_MODE: ${{ env.NITPI_INPUT_MODE }}
+          NITPI_INPUT_AUTOMATIC_PRESET: ${{ env.NITPI_INPUT_AUTOMATIC_PRESET }}
+          NITPI_INPUT_EVENT_OPENED: ${{ env.NITPI_INPUT_EVENT_OPENED }}
+          NITPI_INPUT_EVENT_REOPENED: ${{ env.NITPI_INPUT_EVENT_REOPENED }}
+          NITPI_INPUT_EVENT_SYNCHRONIZE: ${{ env.NITPI_INPUT_EVENT_SYNCHRONIZE }}
+          NITPI_INPUT_EVENT_READY_FOR_REVIEW: ${{ env.NITPI_INPUT_EVENT_READY_FOR_REVIEW }}
+          NITPI_INPUT_WAIT_FOR_CHECKS: ${{ env.NITPI_INPUT_WAIT_FOR_CHECKS }}
+        run: |
+          set -euo pipefail
+          field() { jq -r "$1" "$GITHUB_EVENT_PATH"; }
+          mode="${NITPI_INPUT_MODE:-manual}"
+          if [ "${NITPI_INPUT_AUTOMATIC_PRESET:-}" = "true" ]; then mode="automatic"; fi
+
+          if [ "$GITHUB_EVENT_NAME" = "issue_comment" ]; then
+            [ "$(field '.issue.pull_request')" != "null" ] || { echo "not a pull-request comment"; exit 0; }
+            body="$(field '.comment.body' | head -n1 | sed 's/^[[:space:]]*//')"
+            case "$body" in
+              "/review cancel"*) command="review-cancel" ;;
+              "/review clean"*)  command="review-clean" ;;
+              "/review" | "/review "*) command="review" ;;
+              *) echo "not a review command"; exit 0 ;;
+            esac
+            {
+              echo "kind=issue-comment"
+              echo "command=$command"
+              echo "pr_number=$(field '.issue.number')"
+              echo "proceed=yes"
+              echo "fetch=yes"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$GITHUB_EVENT_NAME" = "pull_request_target" ]; then
+            action="$(field '.action')"
+            pr="$(field '.pull_request.number')"
+            case "$action" in
+              closed | converted_to_draft)
+                # Stop events (ticket 09) run in every mode; the head may be
+                # gone (deleted fork), so nothing is fetched.
+                echo "kind=pull-request"; echo "pr_action=$action"; echo "pr_number=$pr"
+                echo "proceed=yes"; echo "fetch=no"
+                exit 0 ;;
+              opened)        toggle="NITPI_INPUT_EVENT_OPENED" ;;
+              reopened)      toggle="NITPI_INPUT_EVENT_REOPENED" ;;
+              synchronize)   toggle="NITPI_INPUT_EVENT_SYNCHRONIZE" ;;
+              ready_for_review) toggle="NITPI_INPUT_EVENT_READY_FOR_REVIEW" ;;
+              *) echo "ignoring pull-request action '$action'"; exit 0 ;;
+            esac
+            if [ "$mode" != "automatic" ]; then
+              echo "manual mode: pull-request event '$action' starts no review"
+              exit 0
+            fi
+            [ "${!toggle:-}" = "true" ] || { echo "automatic review for '$action' is disabled"; exit 0; }
+            {
+              echo "kind=pull-request"
+              echo "pr_action=$action"
+              echo "pr_number=$pr"
+              echo "proceed=yes"
+              echo "fetch=yes"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$GITHUB_EVENT_NAME" = "check_run" ]; then
+            checks="${NITPI_INPUT_WAIT_FOR_CHECKS:-}"
+            [ -n "$checks" ] || { echo "no named checks configured; nothing to re-kick"; exit 0; }
+            check_name="$(field '.check_run.name')"
+            pr="$(field '.check_run.pull_requests[0].number // empty')"
+            [ -n "$pr" ] || { echo "check run is not attached to a pull request"; exit 0; }
+            case ",$checks," in
+              *",$check_name,"*) ;;
+              *) echo "check '$check_name' is not watched"; exit 0 ;;
+            esac
+            {
+              echo "kind=check-run-rekick"
+              echo "pr_number=$pr"
+              echo "proceed=yes"
+              echo "fetch=yes"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "unhandled event '$GITHUB_EVENT_NAME'"
+
+  # ─── Run the review host against the delivered event ─────────────────────
+  review:
+    name: review the pull request
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    needs: decide
+    if: needs.decide.outputs.proceed == 'yes'
+    steps:
+      # The trusted layer: the workflow file's own revision (the default
+      # branch, for issue_comment and pull_request_target alike) provides the
+      # entry scripts, the host code and the pinned repository instructions.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Pin the instructions revision (the checked-out default branch)
+        run: echo "NITPI_MAIN_REV=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      # The reviewed head as git objects only (its code is never executed by
+      # the workflow): the entry derives the reviewers' unchanged per-stage
+      # worktrees from this checkout. `refs/pull/N/head` carries fork heads
+      # too; a push that raced the delivery is handled by the next delivery.
+      - name: Fetch the reviewed head
+        if: needs.decide.outputs.fetch == 'yes'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ needs.decide.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" \
+            fetch --no-tags --depth=1 origin "refs/pull/$PR_NUMBER/head"
+
+      # The runner joins the tailnet as an ephemeral node tagged for CI
+      # (spec Configuration): the OAuth client is created with the `auth_keys`
+      # scope and the tag below assigned, and OAuth-registered nodes are
+      # ephemeral by default, so the node drops from the tailnet when the
+      # job ends. The tailnet ACL (docs/actions-setup.md) lets that tag reach
+      # ONLY the storage endpoint, so the runner's network access to the
+      # homeserver is the storage service and nothing else.
+      - name: Join the tailnet (ephemeral tagged node)
+        env:
+          TS_AUTHKEY: ${{ secrets.NITPI_TAILSCALE_OAUTH_SECRET }}
+          TS_HOSTNAME: nitpi-gh-${{ github.run_id }}-${{ github.run_attempt }}
+          TS_TAGS: ${{ env.NITPI_TAILSCALE_TAG }}
+        run: |
+          set -euo pipefail
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up \
+            --auth-key="$TS_AUTHKEY" \
+            --hostname="$TS_HOSTNAME" \
+            --advertise-tags="$TS_TAGS" \
+            --accept-dns=false
+
+      # The delivered event, one invocation. The settings arrive through the
+      # workflow env block above; the credentials through secrets; the event
+      # routing through the decide job's outputs.
+      - name: Deliver the event to the review host
+        env:
+          NITPI_ACTION: ${{ needs.decide.outputs.kind }}
+          NITPI_COMMAND: ${{ needs.decide.outputs.command }}
+          NITPI_INPUT_PR_ACTION: ${{ needs.decide.outputs.pr_action }}
+          NITPI_INPUT_PR_NUMBER: ${{ needs.decide.outputs.pr_number }}
+          NITPI_DELIVERY_ID: ${{ github.event_name == 'issue_comment' && format('comment-{0}', github.event.comment.id) || github.event_name == 'pull_request_target' && format('pr-{0}-{1}-{2}', github.event.pull_request.number, github.event.action, github.event.pull_request.head.sha) || format('kick-{0}', github.event.check_run.id) }}
+          NITPI_SECRET_PRIMARY_API_KEY: ${{ secrets.NITPI_PRIMARY_API_KEY }}
+          NITPI_SECRET_RE_REVIEW_API_KEY: ${{ secrets.NITPI_RE_REVIEW_API_KEY }}
+          NITPI_SECRET_STORAGE_AUTH_KEY: ${{ secrets.NITPI_STORAGE_AUTH_KEY }}
+          NITPI_SECRET_GITHUB_TOKEN: ${{ secrets.NITPI_GITHUB_TOKEN }}
+          NITPI_REVIEW_INSTRUCTIONS_FILE: ${{ github.workspace }}/.nitpi/review-instructions.md
+          NITPI_INPUT_REVIEW_INSTRUCTIONS_REVISION: ${{ env.NITPI_MAIN_REV }}
+        run: node_modules/.bin/tsx actions/entry.mts

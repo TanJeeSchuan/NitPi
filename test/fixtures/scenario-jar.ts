@@ -37,11 +37,15 @@ export interface ScenarioJarOptions {
 }
 
 export interface ScenarioJar {
+  /** The pull number the fake GitHub serves and the host config targets. */
+  readonly pullNumber: number;
   readonly repo: GitRepoFixture;
   readonly fakeGithub: FakeGitHub;
   readonly githubBase: string;
   readonly primaryStub: ModelStub;
   readonly reReviewStub: ModelStub;
+  /** The model stubs' base URLs (the entry tests wire them as env inputs). */
+  readonly stubBases: { readonly primary: string; readonly reReview: string };
   /** The storage service; the URL is current after stop/start cycles. */
   readonly service: ReviewStorageService;
   readonly dataDir: string;
@@ -112,11 +116,13 @@ export async function openScenarioJar(options: ScenarioJarOptions): Promise<Scen
     get service(): ReviewStorageService {
       return state.service;
     },
+    pullNumber,
     repo,
     fakeGithub,
     githubBase,
     primaryStub,
     reReviewStub,
+    stubBases: { primary: primaryBase, reReview: reReviewBase },
     dataDir,
     headSha: repo.headSha,
     baseSha: repo.baseSha,
