@@ -27,7 +27,6 @@ import {
   resolveConfig,
   validateCustomPrompt,
   type CustomPrompt,
-  type StageInput,
   type ReviewHostConfig,
 } from "./config.js";
 import { resolveInstructions, type ResolvedInstructions } from "./instructions.js";
@@ -58,7 +57,7 @@ export interface ReviewHost {
    * in progress are unaffected — their instructions are stored on the run
    * document.
    */
-  replaceInstructions(role: "primary" | "re-review", prompt: CustomPrompt | undefined): void;
+  replaceCustomPrompt(role: "primary" | "re-review", prompt: CustomPrompt | undefined): void;
   /** Resolves when the run's durable task reaches a terminal state. */
   waitForRun(runId: string): Promise<void>;
   /** Aggregate Pi usage for assertion by tests. */
@@ -120,7 +119,6 @@ export async function openReviewHost(
     config,
     runHistory,
     api: new RestGitHubApi(config.githubBaseUrl, config.githubToken),
-    getInstructions: (role) => resolveInstructions(role, config.repositoryInstructions),
   };
   installReviewTaskDeps(deps);
   harness.resume();
@@ -130,14 +128,25 @@ export async function openReviewHost(
 
 class ReviewHostImpl implements ReviewHost {
   private activeRuns = new Map<string, Promise<void>>();
+  /**
+   * Ticket 10 test seam: per-stage custom prompts, initialized from the
+   * workflow configuration and replaceable between runs the way a workflow
+   * input edit replaces them. The host config itself stays immutable.
+   */
+  private stagePrompts: { primary?: CustomPrompt; reReview?: CustomPrompt };
 
   constructor(
     private readonly harness: Harness,
     private readonly history: RunHistory,
     private readonly models: Models,
-    private config: ReviewHostConfig,
+    private readonly config: ReviewHostConfig,
     private readonly api: GitHubApi,
-  ) {}
+  ) {
+    this.stagePrompts = {
+      ...(config.primary.customPrompt ? { primary: config.primary.customPrompt } : {}),
+      ...(config.reReview.customPrompt ? { reReview: config.reReview.customPrompt } : {}),
+    };
+  }
 
   async handleReviewCommand(command: {
     repository: string;
@@ -210,8 +219,8 @@ class ReviewHostImpl implements ReviewHost {
     // before any model call, so recovery reuses exactly what this run started
     // with even if the configuration changes mid-run.
     const resolved = {
-      primary: this.storedInstructions("primary"),
-      reReview: this.storedInstructions("re-review"),
+      primary: this.resolveStageInstructions("primary"),
+      reReview: this.resolveStageInstructions("re-review"),
     };
     if (!canonicalId) {
       const canonical = await this.history.createCanonicalConversation(
@@ -258,14 +267,13 @@ class ReviewHostImpl implements ReviewHost {
 
   /**
    * Ticket 10: one stage's resolved instructions for this run, from the
-   * configuration the host was opened with.
+   * stage prompts the host currently holds.
    */
-  storedInstructions(role: "primary" | "re-review"): StageInstructionsRecord {
-    const stage = role === "primary" ? this.config.primary : this.config.reReview;
+  resolveStageInstructions(role: "primary" | "re-review"): StageInstructionsRecord {
     const resolved: ResolvedInstructions = resolveInstructions(
       role,
       this.config.repositoryInstructions,
-      stage?.customPrompt,
+      role === "primary" ? this.stagePrompts.primary : this.stagePrompts.reReview,
     );
     return {
       text: resolved.text,
@@ -275,15 +283,15 @@ class ReviewHostImpl implements ReviewHost {
     };
   }
 
-  replaceInstructions(role: "primary" | "re-review", prompt: CustomPrompt | undefined): void {
-    const stage = role === "primary" ? this.config.primary : this.config.reReview;
-    const next: StageInput = { ...stage, ...(prompt ? { customPrompt: prompt } : {}) };
-    if (!prompt) delete (next as { customPrompt?: unknown }).customPrompt;
-    validateCustomPrompt(role, next.customPrompt);
-    this.config =
-      role === "primary"
-        ? { ...this.config, primary: next }
-        : { ...this.config, reReview: next };
+  replaceCustomPrompt(role: "primary" | "re-review", prompt: CustomPrompt | undefined): void {
+    validateCustomPrompt(role, prompt);
+    if (prompt) {
+      if (role === "primary") this.stagePrompts.primary = prompt;
+      else this.stagePrompts.reReview = prompt;
+    } else {
+      if (role === "primary") delete this.stagePrompts.primary;
+      else delete this.stagePrompts.reReview;
+    }
   }
 
   async waitForRun(runId: string): Promise<void> {

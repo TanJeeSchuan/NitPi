@@ -264,7 +264,7 @@ describe("scenario: custom prompts per stage (ticket 10)", () => {
 
       // The configuration changes between the two runs (what a repository
       // owner editing the workflow inputs looks like to the reviewer).
-      stage.host.replaceInstructions("primary", { text: "Second-prompt sentinel.", mode: "append" });
+      stage.host.replaceCustomPrompt("primary", { text: "Second-prompt sentinel.", mode: "append" });
 
       const second = await stage.host.handleReviewCommand({
         repository: "example/widgets",
@@ -297,32 +297,73 @@ describe("scenario: custom prompts per stage (ticket 10)", () => {
     }
   });
 
-  it("recovery after a configuration change reads the run's stored instructions, not the new configuration", async () => {
-    const stage = await openHostWith({
-      primaryPrompt: { text: "Stored at run start.", mode: "replace" },
-      reReviewPrompt: { text: "Also stored.", mode: "append" },
+  it("a mid-run configuration change does not alter the run: both stages run with the instructions stored at command time", async () => {
+    // The configuration changes while the run is in flight — between the
+    // primary's first model request and the re-review phase — the way a
+    // workflow-input edit landing mid-run looks to the reviewer. The phases
+    // read the run document, so both stubs must see the ORIGINAL prompts.
+    const primaryScript: StubScript = [
+      { toolCall: { id: "call-1", name: "read", input: JSON.stringify({ path: "src/handler.ts" }) } },
+      { text: ["Stored-artifact sentinel."], finishReason: "stop" as const },
+    ];
+    const reReviewScript: StubScript = [{ text: [FINAL], finishReason: "stop" as const }];
+    const primary = new ModelStub(primaryScript, "stub-primary", (index) => {
+      // Mid-run configuration change: hits after the primary's first request
+      // was served, while the run is still in the primary phase.
+      if (index === 0) {
+        void stage.then((s) =>
+          s.host.replaceCustomPrompt("re-review", { text: "MID-RUN MUTATED PROMPT sentinel.", mode: "append" }),
+        );
+      }
     });
+    const reReview = new ModelStub(reReviewScript, "stub-rereview");
+    const [primaryBase, reReviewBase] = await Promise.all([primary.listen(), reReview.listen()]);
+    const host = await openReviewHost(
+      {
+        repository: "example/widgets",
+        pullNumber: 7,
+        githubToken: "test-token",
+        githubBaseUrl: githubBase,
+        primary: { baseUrl: `${primaryBase}/v1`, modelId: "stub-primary", apiKey: "stub-primary-key" },
+        reReview: {
+          baseUrl: `${reReviewBase}/v1`,
+          modelId: "stub-rereview",
+          apiKey: "stub-rereview-key",
+          customPrompt: { text: "Re-review prompt stored at run start.", mode: "append" },
+        },
+        repositoryInstructions: "Be strict about unused parameters.",
+        repositoryInstructionsRevision: repo.baseSha,
+        headCheckoutSource: repo.headCheckout(),
+      },
+      join(workspace, `run-${Math.random().toString(36).slice(2)}.sqlite`),
+    );
+    const stage: Promise<Stage> = Promise.resolve({ primaryStub: primary, reReviewStub: reReview, host });
     try {
-      const runId = await startDefaultReview(stage);
-      await stage.host.waitForRun(runId);
+      const started = await host.handleReviewCommand({
+        repository: "example/widgets",
+        pullNumber: 7,
+        requester: "octocat",
+      });
+      await host.waitForRun(started.runId);
 
-      const run = (await stage.host.runHistory().allRuns({} as never)).at(-1)!;
-      // What a recovered process reads for this run: the run document's stored
-      // resolution (pi-durable reads are the same in-process or after reopen).
-      const recoveredPrimary = await stage.host
-        .runHistory()
-        .instructionsFor(run.runId, "primary", {} as never);
-      expect(recoveredPrimary?.text).toContain("Stored at run start.");
-      expect(recoveredPrimary?.promptMode).toBe("replace");
-      expect(recoveredPrimary?.text).not.toContain(POLICY_PIN);
+      // The re-reviewer's system prompt is the stored resolution, which was
+      // pinned before the mid-run change: it carries the original append
+      // prompt and never the mutated text.
+      const rereview = systemMessageOf(reReview);
+      expect(rereview).toContain("Re-review prompt stored at run start.");
+      expect(rereview).not.toContain("MID-RUN MUTATED PROMPT sentinel.");
+      expect(reReview.exhausted).toBe(true);
 
-      const recoveredReReview = await stage.host
-        .runHistory()
-        .instructionsFor(run.runId, "re-review", {} as never);
-      expect(recoveredReReview?.text).toContain("Also stored.");
-      expect(recoveredReReview?.promptMode).toBe("append");
+      // The run document still records what the run actually used, and a
+      // recovered process (which re-reads through instructionsFor) would see
+      // the same text.
+      const run = (await host.runHistory().allRuns({} as never)).at(-1)!;
+      const storedReReview = await host.runHistory().instructionsFor(run.runId, "re-review", {} as never);
+      expect(storedReReview?.text).toContain("Re-review prompt stored at run start.");
+      expect(storedReReview?.text).not.toContain("MID-RUN MUTATED PROMPT sentinel.");
+      expect(storedReReview?.promptMode).toBe("append");
     } finally {
-      await stage.host.close();
+      await host.close();
     }
   });
 

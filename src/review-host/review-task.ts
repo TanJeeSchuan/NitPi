@@ -4,12 +4,14 @@
  * Phases (pipeline, spec "Pi Durable mapping"):
  *   primary → freeze artifact → re-review → final frozen → publish → published
  *
- * Instructions per stage come from the resolved protocol + policy + repository
- * layers (instructions.ts). The primary turn runs in the canonical PR
- * conversation; the re-reviewer runs in a fresh task-owned conversation
- * created by this task with explicit agent configuration, on its own unchanged
- * checkout. It receives the frozen artifact plus repository and PR inputs —
- * never the primary transcript.
+ * Instructions per stage come from the run document's stored resolution
+ * (resolved once at command time; ticket 10), never from the live
+ * configuration — recovery reuses the stored text even if the configuration
+ * changed mid-run. The primary turn runs in the canonical PR conversation;
+ * the re-reviewer runs in a fresh task-owned conversation created by this
+ * task with explicit agent configuration, on its own unchanged checkout. It
+ * receives the frozen artifact plus repository and PR inputs — never the
+ * primary transcript.
  *
  * Module dependencies (`installReviewTaskDeps`) exist because pi-durable
  * resolves task definitions from the registry at invocation: the process-wide
@@ -30,7 +32,6 @@ import {
   type InvalidAnchor,
 } from "./anchor-validation.js";
 import type { ReviewHostConfig } from "./config.js";
-import { resolveInstructions } from "./instructions.js";
 import type { ResolvedInstructions } from "./instructions.js";
 import type {
   RunDocument,
@@ -53,14 +54,6 @@ export interface ReviewTaskDeps {
   readonly config: ReviewHostConfig;
   readonly runHistory: RunHistory;
   readonly api: GitHubApi;
-  /**
-   * Fallback instruction source, used only for a run that predates stored
-   * instructions (no `resolvedInstructions` on the run document). Runs ticket
-   * 10 stores resolve from the run document instead, so a mid-run
-   * configuration change cannot alter them — and recovery reuses the stored
-   * text even when the configuration changed mid-run.
-   */
-  getInstructions(role: "primary" | "re-review"): ResolvedInstructions;
 }
 
 let deps: ReviewTaskDeps | undefined;
@@ -323,9 +316,10 @@ export const reviewTask = defineTask<ReviewTaskInput, ReviewCheckpoint, ReviewTa
 
 /**
  * Ticket 10: the instructions one stage runs with — the run document's stored
- * resolution when present (every run ticket 10 creates, including recovered
- * ones), falling back to the host configuration only for a run that predates
- * stored instructions.
+ * resolution, written at command time before any model call. There is no
+ * fallback: a run whose document has no stored instructions is corrupt, and
+ * re-resolving from the live configuration would let a mid-run configuration
+ * change alter a run already in progress.
  */
 async function instructionsForStage(
   host: ReviewTaskDeps,
@@ -333,18 +327,18 @@ async function instructionsForStage(
   runDoc: RunDocument,
   context: Context,
 ): Promise<ResolvedInstructions> {
-  const stored = runDoc.resolvedInstructions;
-  const record = role === "primary" ? stored?.primary : stored?.reReview;
-  if (record) return storedInstructionsToResolved(record);
-  return host.getInstructions(role);
+  const stored = await host.runHistory.instructionsFor(runDoc.runId, role, context);
+  if (!stored) {
+    throw new Error(`run ${runDoc.runId} has no stored ${role} instructions (corrupt run document)`);
+  }
+  return storedInstructionsToResolved(stored);
 }
 
-/** A stored record is the same shape the resolver produces — validate the mode. */
+/** A stored record is the same shape the resolver produces. */
 function storedInstructionsToResolved(stored: StageInstructionsRecord): ResolvedInstructions {
   if (stored.promptMode !== "append" && stored.promptMode !== "replace" && stored.promptMode !== "none") {
     throw new Error(`stored instructions for the stage have an unknown prompt mode: ${String(stored.promptMode)}`);
   }
-  if (!stored.policyPin) throw new Error("stored instructions are missing the review-policy pin");
   return {
     text: stored.text,
     policyPin: stored.policyPin,

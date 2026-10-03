@@ -37,12 +37,13 @@ export interface RunUsage {
 /** One stage's resolved instructions as stored on the run document (ticket 10). */
 export interface StageInstructionsRecord {
   /** The full resolved instruction block the stage ran with. */
-  text: string;
-  readonly policyPin?: string;
+  readonly text: string;
+  /** Pin provenance of the review-policy layer (the built-in skill's pin). */
+  readonly policyPin: string;
   /** How the custom prompt was applied: `append`, `replace`, or none. */
-  promptMode: "append" | "replace" | "none";
+  readonly promptMode: "append" | "replace" | "none";
   /** The custom prompt text resolved into the instructions, when any. */
-  customPrompt?: string;
+  readonly customPrompt?: string;
 }
 
 export interface RunDocument {
@@ -159,7 +160,7 @@ export class RunHistory {
     context: Context,
   ): Promise<StageInstructionsRecord | undefined> {
     const run = await this.findRun(runId, context);
-    return role === "primary" ? run?.resolvedInstructions?.primary : run?.resolvedInstructions?.reReview;
+    return stageInstructionsRecord(run?.resolvedInstructions, role);
   }
 
   async createCanonicalConversation(
@@ -184,3 +185,11 @@ export class RunHistory {
 }
 
 export type { ConversationId };
+
+/** One stage's record out of a run document's stored resolutions. */
+export function stageInstructionsRecord(
+  stored: { primary?: StageInstructionsRecord; reReview?: StageInstructionsRecord } | undefined,
+  role: "primary" | "re-review",
+): StageInstructionsRecord | undefined {
+  return role === "primary" ? stored?.primary : stored?.reReview;
+}

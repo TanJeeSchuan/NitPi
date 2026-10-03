@@ -106,19 +106,6 @@ export function validateCustomPrompt(stage: string, prompt: CustomPrompt | undef
   }
 }
 
-/**
- * The custom-prompt policy for one stage after validation: `undefined` when the
- * stage has no prompt (built-in policy applies), otherwise the prompt as is.
- */
-export function customPromptPolicy(
-  stage: string,
-  input: StageInput | undefined,
-): CustomPrompt | undefined {
-  if (!input) return undefined;
-  validateCustomPrompt(stage, input.customPrompt);
-  return input.customPrompt;
-}
-
 export function toStageConfig(stage: string, input: StageInput): StageConfig {
   return {
     stage,
