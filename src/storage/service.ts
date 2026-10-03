@@ -59,6 +59,10 @@ export interface ReviewStorageServiceOptions {
   readonly authToken: string;
   /** HTTP port; defaults to an ephemeral one. */
   readonly port?: number;
+  /** Bind address; defaults to the loopback interface. A homeserver
+   *  deployment reached over Tailscale binds its tailnet IP (or the
+   *  wildcard interface, with the tailnet ACL as the access boundary). */
+  readonly host?: string;
   /** Lease lifetime in milliseconds. Default 45s. */
   readonly leaseTtlMs?: number;
 }
@@ -272,12 +276,12 @@ export async function startReviewStorageService(
 
   const port = await new Promise<number>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(options.port ?? 0, "127.0.0.1", () => {
+    server.listen(options.port ?? 0, options.host ?? "127.0.0.1", () => {
       resolve((server.address() as AddressInfo).port);
     });
   });
 
-  const url = `http://127.0.0.1:${port}`;
+  const url = `http://${options.host && options.host !== "0.0.0.0" ? options.host : "127.0.0.1"}:${port}`;
 
   function respond(response: ServerResponse, status: number, body: unknown): void {
     response.statusCode = status;
