@@ -419,15 +419,18 @@ async function settle(
   resumedRunIds: readonly string[],
 ): Promise<number> {
   const waited: string[] = [];
-  if (outcome.runId) {
+  for (const runId of resumedRunIds) {
+    waited.push(runId);
+    await waitOutRun(host, runId);
+  }
+  if (outcome.runId && !waited.includes(outcome.runId)) {
     waited.push(outcome.runId);
     await waitOutRun(host, outcome.runId);
   }
-  if (outcome.outcome === "queued" || outcome.outcome === "deferred" || outcome.outcome === "duplicate") {
+  if ((outcome.outcome === "queued" && resumedRunIds.length === 0) || outcome.outcome === "deferred" || outcome.outcome === "duplicate") {
     // The pending request is durable; this delivery waits on neither the
-    // named checks nor a finishing run — the re-kick deliveries own that
-    // clock, and the host's close abandons its kicked drain loop without
-    // dropping the request.
+    // named checks nor an external owner. Resumed work has already settled;
+    // a queued request behind it continues through this delivery's drain.
     if (outcome.refused) console.log(`refused: ${outcome.refused}`);
     return 0;
   }
@@ -463,29 +466,21 @@ async function settle(
 
 /**
  * Wait one run to its terminal state: through the host's tracker when the
- * run is tracked (started or joined in this process), otherwise by polling
- * the durable run document (a task auto-resumed at open is untracked).
- * A tracked run's failure throws (the exit-1 path); an untracked run's
- * failure is reported by settle's document check. Bounded, so a wedged
- * review cannot camp the job past the Actions timeout by much.
+ * run is tracked (started or joined in this process), otherwise through
+ * its durable task (a task auto-resumed at open is untracked). A tracked
+ * run's failure throws; an untracked run's failure is reported by settle's
+ * document check. Stage deadlines bound the durable task's duration.
  */
-async function waitOutRun(host: ReviewHost, runId: string, budgetMs = 240_000): Promise<void> {
-  const deadline = Date.now() + budgetMs;
-  for (;;) {
-    try {
-      await host.waitForRun(runId);
-      return;
-    } catch (error) {
-      const unknown = error instanceof Error && error.message.startsWith("unknown run");
-      if (!unknown) throw error; // Tracked run failure: the exit-1 path.
-    }
+async function waitOutRun(host: ReviewHost, runId: string): Promise<void> {
+  try {
+    await host.waitForRun(runId);
+  } catch (error) {
+    const unknown = error instanceof Error && error.message.startsWith("unknown run");
+    if (!unknown) throw error;
     const run = await host.runHistory().findRun(runId, TODO_CONTEXT);
-    if (!run || run.checkStatus !== "in progress") return; // settled (or vanished)
-    if (Date.now() > deadline) {
-      console.error(`run ${runId} is still in progress after ${budgetMs}ms; leaving it to the next delivery`);
-      return;
+    if (run?.checkStatus === "in progress") {
+      await host.runHistory().harness.waitForTask(run.pipelineTaskId as never, TODO_CONTEXT);
     }
-    await new Promise((resolve) => setTimeout(resolve, 250));
   }
 }
 

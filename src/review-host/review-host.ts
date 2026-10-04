@@ -391,7 +391,8 @@ class ReviewHostImpl implements ReviewHost {
    */
   private async ensureDrainLoop(repository: string, pullNumber: number): Promise<void> {
     const key = prKey(repository, pullNumber);
-    if (this.draining.has(key)) return;
+    const existing = this.draining.get(key);
+    if (existing) return existing;
     const loop = this.drainLoop(repository, pullNumber).finally(() => this.draining.delete(key));
     this.draining.set(key, loop);
     await loop;
@@ -772,7 +773,8 @@ class ReviewHostImpl implements ReviewHost {
       .then(() => {
         this.activeRuns.delete(runId);
         this.settledRuns.set(runId, finished);
-        return this.ensureDrainLoop(repository, pullNumber).catch(() => undefined);
+        // The drain may be awaiting this task; do not join it from here.
+        void this.ensureDrainLoop(repository, pullNumber).catch(() => undefined);
       });
     this.activeRuns.set(runId, finished);
   }
