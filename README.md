@@ -1,3 +1,5 @@
+# VERY ALPHA, SECURITY WOULD BE BAD, DO NOT USE IN PROD. YET!
+
 # NitPi
 
 A two-stage pull-request reviewer that runs in GitHub Actions. A primary reviewer reads the PR in a sandboxed checkout and writes a review. A second agent, the re-reviewer, gets that frozen review without the primary's conversation, checks every finding against the code, and owns the final list. Surviving findings go to GitHub as inline comments on one review with a maintained summary.
