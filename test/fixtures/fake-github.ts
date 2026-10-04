@@ -129,7 +129,7 @@ export class FakeGitHub {
     readonly pulls: FakePullRequest[],
     readonly diffAnchors: string[] = [],
     readonly options: { diffText?: string } = {},
-    /** What `GET /user` reports as the reviewer bot's login. */
+    /** What GraphQL's viewer reports as the publishing bot's login. */
     readonly botLogin: string = "nitpi-reviewer[bot]",
   ) {
     this.state = {
@@ -271,7 +271,7 @@ export class FakeGitHub {
     }
 
     if (method === "GET" && path === "/user") {
-      this.respond(response, 200, { login: this.botLogin });
+      this.respond(response, 403, { message: "Resource not accessible by integration" });
       return;
     }
     const prMatch = path.match(/^\/repos\/[^/]+\/[^/]+\/pulls\/(\d+)\/reviews$/);
@@ -494,6 +494,10 @@ export class FakeGitHub {
     };
     const query = parsed.query ?? "";
     const variables = parsed.variables ?? {};
+    if (query.includes("viewer")) {
+      this.respond(response, 200, { data: { viewer: { login: this.botLogin } } });
+      return;
+    }
     // `unresolveReviewThread` contains `resolveReviewThread`; test it first.
     if (query.includes("unresolveReviewThread")) return this.mutateThread(variables.input?.threadId, false, "unresolveReviewThread", response);
     if (query.includes("resolveReviewThread")) return this.mutateThread(variables.input?.threadId, true, "resolveReviewThread", response);

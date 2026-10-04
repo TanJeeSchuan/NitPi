@@ -120,8 +120,13 @@ export class RestGitHubApi implements GitHubApi {
     return this.request<unknown>("GET", `/repos/${repository}/commits/${headSha}/check-runs`);
   }
 
-  getAuthenticatedUser() {
-    return this.request<unknown>("GET", "/user");
+  async getAuthenticatedUser() {
+    const response = await this.graphql("query { viewer { login } }", {});
+    if (response.body.errors?.length) {
+      throw new Error(`identifying the reviewer bot: ${response.body.errors.map((error) => error.message).join("; ")}`);
+    }
+    const data = response.body.data as { viewer?: { login?: string } } | undefined;
+    return { ...response, body: { login: data?.viewer?.login } };
   }
 
   graphql(query: string, variables: Record<string, unknown>, signal?: AbortSignal) {
