@@ -694,7 +694,7 @@ export class Publisher {
           return { ok: false, status: 422, reason: `GitHub rejected the review: ${describeBody(response.body)}` };
         }
         const created = response.body as { id?: number; comments?: Array<{ id: number }> };
-        if (response.status !== 201) {
+        if (response.status !== 200) {
           return { ok: false, status: response.status, reason: `GitHub create review failed with HTTP ${response.status}: ${describeBody(response.body)}` };
         }
         if (typeof created.id !== "number") {

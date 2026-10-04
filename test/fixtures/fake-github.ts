@@ -292,7 +292,7 @@ export class FakeGitHub {
         return;
       }
       const review = this.createReview(Number(prMatch[1]), parsed);
-      this.respond(response, 201, this.toRestReview(review));
+      this.respond(response, 200, this.toRestReview(review));
       return;
     }
 
