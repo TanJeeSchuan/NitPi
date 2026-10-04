@@ -15,7 +15,7 @@
  * join and the concurrency settings are checked by hand on a real PR
  * (docs/actions-setup.md).
  */
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -258,6 +258,27 @@ describe("entry point: configuration failures exit 2 before anything runs", () =
 });
 
 describe("entry point: delivered triggers", () => {
+  it("finishes a resumed older run and publishes the queued head before exiting", { timeout: 180_000 }, async () => {
+    const jar = await openJar({
+      pullNumber: 19,
+      primaryScript: [{ text: [ARTIFACT], finishReason: "stop" }, EMPTY_TURN, { text: [ARTIFACT], finishReason: "stop" }, EMPTY_TURN],
+      reReviewScript: [{ kind: "hang" }, { text: [FINAL_REVIEW], finishReason: "stop" }, EMPTY_TURN, { text: [FINAL_REVIEW], finishReason: "stop" }, EMPTY_TURN],
+    });
+    const host = await jar.openHost();
+    await host.handleReviewCommand({ repository: "example/scenario", pullNumber: 19, requester: "octocat" });
+    await stubServed(jar.reReviewStub, 1);
+    await host.close();
+    execFileSync("git", ["-C", jar.repo.headCheckout(), "commit", "--allow-empty", "-m", "new head"]);
+    const pushed = execFileSync("git", ["-C", jar.repo.headCheckout(), "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    jar.fakeGithub.state.pulls[19]!.headSha = pushed;
+
+    const result = await runEntry(jar, { NITPI_ACTION: "issue-comment", NITPI_INPUT_COMMAND: "review", NITPI_DELIVERY_ID: "new-head-after-crash" });
+    expect(result.stderr).not.toContain("reviewer run failed");
+    expect(result.status).toBe(0);
+    expect(jar.fakeGithub.publishedReviews(19)).toHaveLength(1);
+    expect(jar.fakeGithub.publishedReviews(19)[0]!.commitId).toBe(pushed);
+  });
+
   it("delivers /review end to end, then dedupes a redelivered comment id", { timeout: 180_000 }, async () => {
     const jar = await openJar({
       pullNumber: 11,
