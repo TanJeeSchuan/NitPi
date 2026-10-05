@@ -305,11 +305,11 @@ export class FakeGitHub {
       return;
     }
 
-    const reviewPatch = path.match(/^\/repos\/[^/]+\/[^/]+\/pulls\/(\d+)\/reviews\/(\d+)$/);
-    if (method === "PATCH" && reviewPatch) {
+    const reviewUpdate = path.match(/^\/repos\/[^/]+\/[^/]+\/pulls\/(\d+)\/reviews\/(\d+)$/);
+    if (method === "PUT" && reviewUpdate) {
       const parsed = JSON.parse(body) as { body?: string };
       const review = this.state.reviews.find(
-        (r) => r.id === Number(reviewPatch[2]) && r.pullNumber === Number(reviewPatch[1]),
+        (r) => r.id === Number(reviewUpdate[2]) && r.pullNumber === Number(reviewUpdate[1]),
       );
       if (!review) {
         this.respond(response, 404, { message: "Not Found" });
