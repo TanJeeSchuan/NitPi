@@ -58,7 +58,7 @@ export class RestGitHubApi implements GitHubApi {
 
   updateReview(repository: string, pullNumber: number, reviewId: number, payload: unknown) {
     return this.request<unknown>(
-      "PATCH",
+      "PUT",
       `/repos/${repository}/pulls/${pullNumber}/reviews/${reviewId}`,
       payload,
     );
