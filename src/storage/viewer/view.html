@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NitPi</title>
+<style>
+  :root{color-scheme:dark;font:14px system-ui,sans-serif;background:#151718;color:#e4e6e7}
+  body{margin:0;display:grid;grid-template-columns:300px minmax(0,1fr);min-height:100vh}
+  nav{border-right:1px solid #303436;padding:12px}main{padding:28px 36px;max-width:1100px}
+  a{color:#b8d6cf}h2{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#939b9e;margin:16px 8px 6px}
+  nav a{display:block;padding:8px;border-radius:4px;text-decoration:none;color:inherit}nav a[aria-current]{background:#28322f}
+  small,.muted{color:#939b9e;font-size:12px}h1{font-size:22px;font-weight:550;margin:0 0 8px}
+  pre{font:12px/1.6 ui-monospace,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;margin:8px 0}
+  details{border-bottom:1px solid #303638;padding:8px 0}summary{cursor:pointer;font-size:12px;color:#c2cbce}
+  .live{border-left:2px solid #91c4b5;padding:4px 12px;background:#1b211f}#error{color:#f0b8ad;white-space:pre-wrap}
+  @media(max-width:760px){body{grid-template-columns:1fr}nav{border:0;max-height:40vh;overflow:auto}main{padding:20px}}
+</style>
+</head>
+<body>
+<nav id="runs"></nav>
+<main><pre id="error"></pre><div id="run" class="muted">Select a run.</div></main>
+<script>
+const $ = id => document.getElementById(id);
+const el = (tag, text, attrs = {}) => Object.assign(document.createElement(tag), { textContent: text ?? '' }, attrs);
+const when = ms => ms ? new Date(ms).toLocaleString() : '';
+const params = new URLSearchParams(location.hash.slice(1));
+if (params.has('token')) { sessionStorage.setItem('nitpi-token', params.get('token')); params.delete('token'); history.replaceState(null, '', `#${params}`); }
+const token = sessionStorage.getItem('nitpi-token');
+const selected = () => new URLSearchParams(location.hash.slice(1)).get('run');
+let busy = false, shown;
+
+function messageText(message) {
+  if (typeof message.content === 'string') return message.content;
+  return (message.content ?? []).map(part =>
+    part.type === 'text' ? part.text : part.type === 'thinking' ? part.thinking :
+    part.type === 'toolCall' ? `${part.name}\n${JSON.stringify(part.arguments, null, 2)}` : `[${part.type}]`).join('\n\n');
+}
+
+function renderRuns(runs) {
+  const nav = [];
+  for (const [label, active] of [['In progress', true], ['History', false]]) {
+    nav.push(el('h2', label));
+    for (const run of runs.filter(run => (run.status === 'in progress') === active)) {
+      const link = el('a', `${run.repository} #${run.pullNumber}`, { href: `#run=${run.runId}` });
+      if (run.runId === selected()) link.setAttribute('aria-current', 'true');
+      link.append(el('br'), el('small', `${run.status} · ${run.phase} · ${when(run.startedAt)}`));
+      nav.push(link);
+    }
+  }
+  $('runs').replaceChildren(...nav);
+}
+
+function renderRun(run) {
+  if (!run) return $('run').replaceChildren(selected() ? 'Run unavailable.' : 'Select a run.');
+  const encoded = JSON.stringify(run);
+  if (encoded === shown) return;
+  shown = encoded;
+  const open = new Set([...$('run').querySelectorAll('details[open]')].map(item => item.dataset.id));
+  const section = (id, label, content) => {
+    const item = el('details', '', { open: open.has(id) }); item.dataset.id = id;
+    item.append(el('summary', label), el('pre', content)); return item;
+  };
+  const pr = `https://github.com/${run.repository}/pull/${run.pullNumber}`;
+  const facts = el('p', `${run.status} · ${run.phase} · ${run.mode} · ${run.headSha.slice(0, 12)} · ${when(run.startedAt)}${run.requester ? ` · by ${run.requester}` : ''}${run.tokens ? ` · ${run.tokens.toLocaleString()} tokens` : ''} · `, { className: 'muted' });
+  facts.append(el('a', 'PR', { href: pr, target: '_blank', rel: 'noopener' }));
+  if (run.reviewId) facts.append(' · ', el('a', 'published review', { href: `${pr}#pullrequestreview-${run.reviewId}`, target: '_blank', rel: 'noopener' }));
+  const parts = [el('h1', `${run.repository} #${run.pullNumber}`), facts];
+  if (run.reason) parts.push(el('pre', run.reason));
+  if (run.finalReview) parts.push(el('pre', run.finalReview));
+  if (run.artifact) parts.push(section('artifact', 'Primary review', run.artifact));
+  if (run.auditNotes) parts.push(section('audit', 'Audit notes', run.auditNotes));
+  parts.push(el('h2', 'Activity'));
+  for (const { id, message } of run.activity) {
+    const content = messageText(message);
+    if (content) parts.push(section(id, `${message.toolName || message.role} ${when(message.timestamp)}`, content));
+  }
+  for (const { message } of run.live) {
+    const item = el('div', '', { className: 'live' });
+    item.append(el('small', `${message.toolName || message.role} · live`), el('pre', messageText(message)));
+    parts.push(item);
+  }
+  $('run').replaceChildren(...parts);
+}
+
+async function refresh() {
+  if (!token) return void ($('error').textContent = 'Open this page as /view#token=<storage token>.');
+  if (busy) return;
+  busy = true;
+  const run = selected();
+  try {
+    const response = await fetch(`/v1/view/runs${run ? `?run=${encodeURIComponent(run)}` : ''}`, { headers: { Authorization: `Bearer ${token}` } });
+    if (!response.ok) throw new Error(response.status === 401 ? 'Storage token rejected.' : `Storage returned HTTP ${response.status}.`);
+    const data = await response.json();
+    if (run !== selected()) return;
+    $('error').textContent = data.errors.map(error => `${error.file}: ${error.message}`).join('\n');
+    renderRuns(data.runs); renderRun(data.selected);
+  } catch (error) {
+    $('error').textContent = `Disconnected: ${error.message}`;
+  } finally {
+    busy = false;
+    if (run !== selected()) void refresh();
+  }
+}
+
+window.addEventListener('hashchange', () => { shown = undefined; $('run').replaceChildren('Loading…'); void refresh(); });
+document.addEventListener('visibilitychange', () => { if (!document.hidden) void refresh(); });
+setInterval(() => { if (!document.hidden) void refresh(); }, 2000);
+void refresh();
+</script>
+</body>
+</html>

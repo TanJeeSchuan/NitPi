@@ -60,7 +60,7 @@ Three pieces:
 
 - **The workflow** (`.github/workflows/tailscale-review.yml`). It runs from the default branch on `issue_comment`, `pull_request_target` and `check_run`. It fetches the PR head as git objects only and never executes PR code. Settings go in its `env` block as `NITPI_INPUT_*` variables. The job's own `GITHUB_TOKEN` stays `contents: read`, and a fine-grained PAT does the publishing.
 - **Tailscale.** The runner joins the tailnet as an ephemeral node tagged `tag:ci-nitpi-reviewer`. The ACL lets that tag reach the storage port and nothing else.
-- **The storage service** (`src/storage/service-main.ts`). It runs on the homeserver and keeps one SQLite file per (repository, PR), written with `synchronous=FULL`. It leases each partition to one process at a time.
+- **The storage service** (`src/storage/service-main.ts`). It runs on the homeserver and keeps one SQLite file per (repository, PR), written with `synchronous=FULL`. It leases each partition to one process at a time. It also serves a read-only run viewer at `/view`: open `http://<storage host>:<port>/view#token=<storage token>` from any tailnet device. The page keeps the token in that tab's session storage and refreshes every two seconds. It reads SQLite without a lease, so it works while a review is running.
 
 [docs/actions-setup.md](docs/actions-setup.md) has the full setup: every input, the secrets, the Tailscale OAuth client and ACL, a systemd unit for the storage service, and the manual verification checklist.
 
@@ -84,7 +84,7 @@ The scenario tests in `test/scenario/` run the real review host against a real s
 | `src/review-host/` | Host wiring, the durable review task, trigger gate, config, instructions, artifact parsing, anchor validation, matching, run history |
 | `src/github/` | REST client, publisher, publication ledger, retry |
 | `src/pi-bridge/` | AI SDK to pi-ai provider bridge |
-| `src/storage/` | Storage service, HTTP wire protocol, and the client-side `Storage` adapter |
+| `src/storage/` | Storage service, HTTP wire protocol, the client-side `Storage` adapter, and the run viewer (`viewer/`) |
 | `CONTEXT.md` | Domain vocabulary: primary reviewer, re-reviewer, clean review, stale run, and so on |
 | `research/` | Notes checked against primary sources: Actions trust boundaries, the GitHub review API, Pi Durable guarantees |
 | `prototypes/` | Throwaway HTML simulation of the review conversation model |

@@ -7,7 +7,7 @@
  * to relay Pi's `Storage` contract over HTTP.
  *
  * Protocol guarantees:
- * - Authentication: every route except /v1/health carries
+ * - Authentication: every route except /v1/health and /view carries
  *   `Authorization: Bearer <token>`.
  * - Partitioning: one SQLite file per (repository, pull number).
  * - Durable commits: the partition runs SQLite in WAL with
@@ -21,9 +21,13 @@
  * - Single owner: `/v1/open` takes a lease on the partition; a second
  *   opener is refused with `StorageInUseError` while the lease is live.
  *   Heartbeats renew the lease; expiry frees the partition for a re-run.
+ * - Viewing: `/view` serves a static page (no data; unauthenticated) that
+ *   reads `/v1/view/runs` with the bearer token. That route reads SQLite
+ *   directly without a lease, so it works during an active review.
  */
 
 import { dirname, join } from "node:path";
+import { readFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -51,6 +55,9 @@ import { openNodeSqliteDatabase } from "@earendil-works/pi-durable/storage/sqlit
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { SqliteDatabase } from "@earendil-works/pi-durable/storage/sqlite";
 import type { StoragePartitionId } from "./wire.js";
+import { readRuns } from "./viewer/runs.js";
+
+const viewPage = readFileSync(new URL("./viewer/view.html", import.meta.url));
 
 export interface ReviewStorageServiceOptions {
   /** Directory that holds the per-partition SQLite files. */
@@ -385,6 +392,14 @@ export async function startReviewStorageService(
       return respond(response, 200, { ok: true });
     }
 
+    if (path === "/view") {
+      response.writeHead(200, {
+        "content-type": "text/html; charset=utf-8",
+        "content-security-policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
+      });
+      return void response.end(viewPage);
+    }
+
     const auth = request.headers.authorization ?? "";
     if (auth !== `Bearer ${options.authToken}`) {
       return respond(response, 401, {
@@ -393,6 +408,9 @@ export async function startReviewStorageService(
     }
 
     try {
+      if (path === "/v1/view/runs" && request.method === "GET") {
+        return respond(response, 200, readRuns(options.dataDir, pathUrl.searchParams.get("run") ?? undefined));
+      }
       if (path === "/v1/open" && request.method === "POST") {
         const body = (await readBody(request)) as { repository?: string; pullNumber?: number } | undefined;
         const repository = String(body?.repository ?? "");
